@@ -731,7 +731,6 @@ client.on('messageCreate', async (msg) => {
           value: [
             `**Uso:** \`${PREFIX}cadastrar <nick-ubisoft>\``,
             `O **nick** é o que aparece na URL do TRN.`,
-            `Ex.: https://r6.tracker.network/r6siege/profile/ubi/**gabrielgadelham**/overview`,
             `→ \`${PREFIX}cadastrar gabrielgadelham\``,
           ].join('\n'),
           inline: false
