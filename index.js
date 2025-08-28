@@ -1,12 +1,13 @@
 // index.js
 // ------------------------------------------------------------
 // Bot de Discord para relatórios e rankings de R6 Siege (TRN)
-// Comandos: /cadastrar, /daily_report, /weekly_report, /monthly_report,
-//           /programar, /daily_ranking, /weekly_ranking, /monthly_ranking
-// Persistência: SQLite (players por guild; agendamento por guild)
-// Scraper: importado de ./scrape.js (Puppeteer + Stealth)
-// Timezone: controlado por TZ em .env (ex.: America/Fortaleza)
-// Confirmações: acks imediatos e mensagens finais por comando
+// Comandos Slash: /cadastrar, /programar, /daily_report, /weekly_report, /monthly_report,
+//                 /daily_ranking, /weekly_ranking, /monthly_ranking
+// Comandos Prefixo (texto): !cadastrar, !programar, !daily_report, !weekly_report, !monthly_report,
+//                           !daily_ranking, !weekly_ranking, !monthly_ranking
+// Persistência: SQLite (players/agendamentos por guild)
+// Scraper: ./scrape.js (Puppeteer + Stealth)
+// Timezone: TZ no .env (ex.: America/Fortaleza)
 // ------------------------------------------------------------
 
 import 'dotenv/config';
@@ -19,6 +20,7 @@ import {
   PermissionFlagsBits,
   EmbedBuilder,
   ChannelType,
+  Partials,
 } from 'discord.js';
 import cron from 'node-cron';
 import Database from 'better-sqlite3';
@@ -30,9 +32,10 @@ import { scrapeDailyBlocks } from './scrape.js';
 // -------------------------------
 const {
   DISCORD_TOKEN,
-  GUILD_ID,               // opcional (registro rápido dos comandos em 1 guild)
-  GUILD_IDS,              // opcional (registro em várias guilds: "id1,id2,...")
+  GUILD_ID,
+  GUILD_IDS,
   TZ = 'America/Fortaleza',
+  PREFIX = '!',
 } = process.env;
 
 if (!DISCORD_TOKEN) {
@@ -80,7 +83,7 @@ function parseDateLabelToISO(dateLabel, now = DateTime.now().setZone(TZ)) {
   const curYear = now.year;
   let dt = DateTime.fromFormat(`${dateLabel} ${curYear}`, 'LLL dd yyyy', { zone: TZ, locale: 'en' });
   if (!dt.isValid) return null;
-  if (dt > now.plus({ days: 2 })) dt = dt.minus({ years: 1 }); // ajuste de virada de ano
+  if (dt > now.plus({ days: 2 })) dt = dt.minus({ years: 1 });
   return dt.toISODate();
 }
 
@@ -104,8 +107,6 @@ function filterBlocksByRange(blocks, range) {
 }
 
 function aggregate(blocks) {
-  // KD = K_total / D_total (protege divisão por zero)
-  // HS% ponderado por kills: (Σ (hs% * K)) / (Σ K)
   let totalK = 0, totalD = 0, totalWins = 0, totalLosses = 0;
   let hsShotsEst = 0;
 
@@ -162,7 +163,7 @@ function embedRanking(rangeTitle, rankings) {
 }
 
 // -------------------------------
-// Coleta por usuário e por guild
+// Coleta
 // -------------------------------
 async function collectForUser(username, range) {
   const { url, blocks } = await scrapeDailyBlocks(username);
@@ -202,9 +203,9 @@ function buildRankings(collected) {
 }
 
 // -------------------------------
-// Cron diário por guild
+// Cron diário
 // -------------------------------
-const guildCrons = new Map(); // guild_id -> cron task
+const guildCrons = new Map();
 
 function parseHHmm(s) {
   const m = /^([01]\d|2[0-3]):([0-5]\d)$/.exec((s||'').trim());
@@ -222,7 +223,7 @@ async function installCronForGuild(client, guildId) {
   const old = guildCrons.get(guildId);
   if (old) old.stop();
 
-  const expr = `${parsed.mm} ${parsed.hh} * * *`; // todo dia hh:mm
+  const expr = `${parsed.mm} ${parsed.hh} * * *`;
   const task = cron.schedule(expr, async () => {
     try {
       const ch = await client.channels.fetch(channel_id);
@@ -261,8 +262,17 @@ async function installAllCrons(client) {
 // -------------------------------
 // Discord client + slash commands
 // -------------------------------
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+// IMPORTANTE: para prefixo, precisamos ler mensagens => intents abaixo
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,           // slash, guild info
+    GatewayIntentBits.GuildMessages,    // ler mensagens de texto
+    GatewayIntentBits.MessageContent,   // CONTEÚDO das mensagens (ative no portal!)
+  ],
+  partials: [Partials.Channel],
+});
 
+// Slash
 const slashCommands = [
   new SlashCommandBuilder()
     .setName('cadastrar')
@@ -293,17 +303,9 @@ const slashCommands = [
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
-  new SlashCommandBuilder()
-    .setName('daily_ranking')
-    .setDescription('Ranking de HOJE'),
-
-  new SlashCommandBuilder()
-    .setName('weekly_ranking')
-    .setDescription('Ranking dos ÚLTIMOS 7 DIAS'),
-
-  new SlashCommandBuilder()
-    .setName('monthly_ranking')
-    .setDescription('Ranking dos ÚLTIMOS 30 DIAS'),
+  new SlashCommandBuilder().setName('daily_ranking').setDescription('Ranking de HOJE'),
+  new SlashCommandBuilder().setName('weekly_ranking').setDescription('Ranking dos ÚLTIMOS 7 DIAS'),
+  new SlashCommandBuilder().setName('monthly_ranking').setDescription('Ranking dos ÚLTIMOS 30 DIAS'),
 ].map(c => c.toJSON());
 
 async function registerSlashCommands() {
@@ -322,7 +324,7 @@ async function registerSlashCommands() {
     console.log(`Comandos registrados na guild ${GUILD_ID}.`);
   } else {
     await rest.put(Routes.applicationCommands(appId), { body: slashCommands });
-    console.log('Comandos registrados globalmente (podem demorar para aparecer).');
+    console.log('Comandos registrados globalmente (podem demorar a aparecer).');
   }
 }
 
@@ -337,24 +339,18 @@ client.once('ready', async () => {
 });
 
 // -------------------------------
-// Helper de confirmação (acks)
+// Helpers de confirmação (slash)
 // -------------------------------
 async function confirm(ix, message, { ephemeral = false, edit = false } = {}) {
   const payload = typeof message === 'string' ? { content: message } : message;
 
-  if (edit) {
-    return ix.editReply(payload);
-  }
-
-  if (ix.deferred || ix.replied) {
-    return ix.followUp({ ...payload, ephemeral });
-  }
-
+  if (edit) return ix.editReply(payload);
+  if (ix.deferred || ix.replied) return ix.followUp({ ...payload, ephemeral });
   return ix.reply({ ...payload, ephemeral });
 }
 
 // -------------------------------
-// Handler de comandos (com confirmações)
+// Handler: SLASH
 // -------------------------------
 client.on('interactionCreate', async (ix) => {
   if (!ix.isChatInputCommand()) return;
@@ -362,7 +358,6 @@ client.on('interactionCreate', async (ix) => {
   const name = ix.commandName;
   const guildId = ix.guildId;
 
-  // =============== /cadastrar ===============
   if (name === 'cadastrar') {
     if (!ix.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
       await confirm(ix, '❌ Apenas admins (Manage Server) podem cadastrar jogadores.', { ephemeral: true });
@@ -371,103 +366,181 @@ client.on('interactionCreate', async (ix) => {
     const nick = ix.options.getString('nick', true).trim();
     qInsertPlayer.run(guildId, nick);
     const total = qListPlayers.all(guildId).length;
-
-    await confirm(
-      ix,
-      `✅ **${nick}** cadastrado para rastrear neste servidor.\n📚 Jogadores cadastrados agora: **${total}**.`,
-      { ephemeral: true }
-    );
+    await confirm(ix, `✅ **${nick}** cadastrado.\n📚 Jogadores: **${total}**.`, { ephemeral: true });
     return;
   }
 
-  // =============== /programar ===============
   if (name === 'programar') {
     if (!ix.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
-      await confirm(ix, '❌ Apenas admins (Manage Server) podem programar o relatório.', { ephemeral: true });
+      await confirm(ix, '❌ Apenas admins (Manage Server) podem programar.', { ephemeral: true });
       return;
     }
     const channel = ix.options.getChannel('canal', true);
     const horario = ix.options.getString('horario', true);
     const parsed = parseHHmm(horario);
-
     if (!parsed) {
-      await confirm(ix, '⚠️ Formato inválido. Use **HH:mm** (24h), ex.: `23:55`.', { ephemeral: true });
+      await confirm(ix, '⚠️ Use **HH:mm** (24h), ex.: `23:55`.', { ephemeral: true });
       return;
     }
-
-    await confirm(ix, `🗓️ Recebi: vou agendar o envio diário para **${channel}** às **${horario} ${TZ}**…`, { ephemeral: true });
-
+    await confirm(ix, `🗓️ Agendando **${horario} ${TZ}** em ${channel}…`, { ephemeral: true });
     qUpsertSchedule.run(guildId, channel.id, horario);
     await installCronForGuild(client, guildId);
-
-    await confirm(ix, `✅ Agendamento criado/atualizado com sucesso!\n• Canal: ${channel}\n• Horário: **${horario} ${TZ}**`, { ephemeral: true });
+    await confirm(ix, `✅ Agendado!\n• Canal: ${channel}\n• Horário: **${horario} ${TZ}**`, { ephemeral: true });
     return;
   }
 
-  // =============== Map de intervalos ===============
   const rangeMap = {
-    daily_report:   'day',
-    weekly_report:  'week',
-    monthly_report: 'month',
-    daily_ranking:   'day',
-    weekly_ranking:  'week',
-    monthly_ranking: 'month',
+    daily_report: 'day', weekly_report: 'week', monthly_report: 'month',
+    daily_ranking: 'day', weekly_ranking: 'week', monthly_ranking: 'month',
   };
 
-  // =============== Relatórios & Rankings ===============
   if (name in rangeMap) {
     const range = rangeMap[name];
-
-    await ix.deferReply(); // público (se quiser privado: { ephemeral: true })
-
-    const label =
-      range === 'day' ? 'de hoje' :
-      range === 'week' ? 'dos últimos 7 dias' :
-      'dos últimos 30 dias';
-
-    await confirm(ix, `🔎 Recebi o comando **/${name}** — gerando ${name.endsWith('report') ? 'relatório' : 'ranking'} ${label}…`);
+    await ix.deferReply();
+    const label = range === 'day' ? 'de hoje' : range === 'week' ? 'dos últimos 7 dias' : 'dos últimos 30 dias';
+    await confirm(ix, `🔎 Recebi **/${name}** — gerando ${name.endsWith('report') ? 'relatório' : 'ranking'} ${label}…`);
 
     try {
       const results = await collectForGuild(guildId, range);
-
       if (!results.length) {
-        await confirm(ix, '⚠️ Nenhum jogador cadastrado. Use `/cadastrar nick` primeiro.', { edit: true });
+        await confirm(ix, '⚠️ Nenhum jogador cadastrado. Use `/cadastrar nick`.', { edit: true });
         return;
       }
-
       const total = results.length;
       const ok = results.filter(r => !r.error).length;
       const fail = total - ok;
 
       if (name.endsWith('report')) {
-        const title =
-          range === 'day' ? 'Hoje' :
-          range === 'week' ? 'Últimos 7 dias' : 'Últimos 30 dias';
-
+        const title = range === 'day' ? 'Hoje' : range === 'week' ? 'Últimos 7 dias' : 'Últimos 30 dias';
         for (const r of results) {
-          if (r.error) {
-            await confirm(ix, `❌ Falha ao ler **${r.username}** — ${r.err || 'erro'}`);
-          } else {
-            await confirm(ix, { embeds: [embedReport(title, r.username, r.url, r.agg)] });
-          }
+          if (r.error) await confirm(ix, `❌ Falha em **${r.username}** — ${r.err || 'erro'}`);
+          else await confirm(ix, { embeds: [embedReport(title, r.username, r.url, r.agg)] });
         }
-
-        await confirm(ix, `✅ Relatório ${label} concluído.\n• Processados: **${ok}/${total}** (erros: ${fail}).`, { edit: true });
+        await confirm(ix, `✅ Relatório ${label} concluído. **${ok}/${total}** (erros: ${fail}).`, { edit: true });
       } else {
         const rk = buildRankings(results);
-        const title =
-          range === 'day' ? '— Hoje' :
-          range === 'week' ? '— Últimos 7 dias' : '— Últimos 30 dias';
-
+        const title = range === 'day' ? '— Hoje' : range === 'week' ? '— Últimos 7 dias' : '— Últimos 30 dias';
         await confirm(ix, { embeds: [embedRanking(title, rk)] }, { edit: true });
-        await confirm(ix, `✅ Ranking ${label} gerado.\n• Considerados: **${ok}/${total}** jogadores (erros: ${fail}).`);
+        await confirm(ix, `✅ Ranking ${label} gerado. Considerados: **${ok}/${total}** (erros: ${fail}).`);
       }
     } catch (e) {
       console.error(e);
-      await confirm(ix, '❌ Não consegui gerar agora. Tente novamente mais tarde.', { edit: true });
+      await confirm(ix, '❌ Não consegui gerar agora. Tente novamente.', { edit: true });
     }
-    return;
   }
 });
 
+// -------------------------------
+// Handler: PREFIXO (mensagens)
+// -------------------------------
+client.on('messageCreate', async (msg) => {
+  if (!msg.guild || msg.author.bot) return;
+  const content = msg.content?.trim();
+  if (!content || !content.startsWith(PREFIX)) return;
+
+  const args = content.slice(PREFIX.length).trim().split(/\s+/);
+  const cmd  = (args.shift() || '').toLowerCase();
+
+  // Helper para checar admin
+  const isAdmin = msg.member?.permissions?.has(PermissionFlagsBits.ManageGuild);
+
+  const send = (m) => msg.channel.send(m);
+
+  // ---- comandos admin
+  if (cmd === 'cadastrar') {
+    if (!isAdmin) return send('❌ Apenas admins (Manage Server) podem usar `!cadastrar`.');
+    const nick = args.join(' ').trim();
+    if (!nick) return send('Uso: `!cadastrar <nick-ubisoft>`');
+    qInsertPlayer.run(msg.guild.id, nick);
+    const total = qListPlayers.all(msg.guild.id).length;
+    return send(`✅ **${nick}** cadastrado. Jogadores agora: **${total}**.`);
+  }
+
+  if (cmd === 'programar') {
+    if (!isAdmin) return send('❌ Apenas admins (Manage Server) podem usar `!programar`.');
+    if (args.length < 2) return send('Uso: `!programar #canal HH:mm`');
+    // canal: menção <#id>, id ou nome
+    const chMention = msg.mentions.channels.first();
+    let target = chMention;
+    if (!target) {
+      const first = args[0];
+      const byId = msg.guild.channels.cache.get(first);
+      if (byId?.isTextBased()) target = byId;
+      if (!target) {
+        // tenta por nome
+        target = msg.guild.channels.cache.find(c => c.isTextBased() && c.name.toLowerCase() === first.replace(/^#/, '').toLowerCase());
+      }
+    }
+    const horario = args[1];
+    const parsed = parseHHmm(horario || '');
+    if (!target?.isTextBased() || !parsed) {
+      return send('Uso: `!programar #canal HH:mm` (ex.: `!programar #r6-status 23:55`)');
+    }
+
+    await send(`🗓️ Agendando relatório diário **${horario} ${TZ}** em ${target}…`);
+    qUpsertSchedule.run(msg.guild.id, target.id, horario);
+    await installCronForGuild(client, msg.guild.id);
+    return send(`✅ Agendado!\n• Canal: ${target}\n• Horário: **${horario} ${TZ}**`);
+  }
+
+  // ---- relatórios / rankings (abertos)
+  const rangeMap = {
+    'daily_report':  'day',
+    'weekly_report': 'week',
+    'monthly_report':'month',
+    'daily_ranking':  'day',
+    'weekly_ranking': 'week',
+    'monthly_ranking':'month',
+  };
+
+  if (cmd in rangeMap) {
+    const range = rangeMap[cmd];
+    const label = range === 'day' ? 'de hoje' : range === 'week' ? 'dos últimos 7 dias' : 'dos últimos 30 dias';
+    await send(`🔎 Recebi **${PREFIX}${cmd}** — gerando ${cmd.endsWith('report') ? 'relatório' : 'ranking'} ${label}…`);
+
+    try {
+      const results = await collectForGuild(msg.guild.id, range);
+      if (!results.length) return send('⚠️ Nenhum jogador cadastrado. Use `/cadastrar nick` ou `!cadastrar <nick>`.');
+
+      const total = results.length;
+      const ok = results.filter(r => !r.error).length;
+      const fail = total - ok;
+
+      if (cmd.endsWith('report')) {
+        const title = range === 'day' ? 'Hoje' : range === 'week' ? 'Últimos 7 dias' : 'Últimos 30 dias';
+        for (const r of results) {
+          if (r.error) await send(`❌ Falha em **${r.username}** — ${r.err || 'erro'}`);
+          else await send({ embeds: [embedReport(title, r.username, r.url, r.agg)] });
+        }
+        await send(`✅ Relatório ${label} concluído. **${ok}/${total}** (erros: ${fail}).`);
+      } else {
+        const rk = buildRankings(results);
+        const title = range === 'day' ? '— Hoje' : range === 'week' ? '— Últimos 7 dias' : '— Últimos 30 dias';
+        await send({ embeds: [embedRanking(title, rk)] });
+        await send(`✅ Ranking ${label} gerado. Considerados: **${ok}/${total}** (erros: ${fail}).`);
+      }
+    } catch (e) {
+      console.error(e);
+      await send('❌ Não consegui gerar agora. Tente novamente em alguns minutos.');
+    }
+    return;
+  }
+
+  // help básico
+  if (cmd === 'help' || cmd === 'ajuda') {
+    return send(
+      [
+        `**Comandos por prefixo (${PREFIX})**`,
+        `• ${PREFIX}cadastrar <nick>  — (admin) adiciona jogador`,
+        `• ${PREFIX}programar #canal HH:mm  — (admin) agenda relatório diário`,
+        `• ${PREFIX}daily_report | ${PREFIX}weekly_report | ${PREFIX}monthly_report`,
+        `• ${PREFIX}daily_ranking | ${PREFIX}weekly_ranking | ${PREFIX}monthly_ranking`,
+        '',
+        'Dica: os mesmos existem como **slash** (`/daily_report`, etc.).'
+      ].join('\n')
+    );
+  }
+});
+
+// -------------------------------
 client.login(DISCORD_TOKEN);
