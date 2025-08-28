@@ -6,6 +6,7 @@
 // Persistência: SQLite (players por guild; agendamento por guild)
 // Scraper: importado de ./scrape.js (Puppeteer + Stealth)
 // Timezone: controlado por TZ em .env (ex.: America/Fortaleza)
+// Confirmações: acks imediatos e mensagens finais por comando
 // ------------------------------------------------------------
 
 import 'dotenv/config';
@@ -29,8 +30,8 @@ import { scrapeDailyBlocks } from './scrape.js';
 // -------------------------------
 const {
   DISCORD_TOKEN,
-  GUILD_ID,               // opcional (registro rápido dos comandos em uma guild)
-  GUILD_IDS,              // opcional (várias guilds: "id1,id2,...")
+  GUILD_ID,               // opcional (registro rápido dos comandos em 1 guild)
+  GUILD_IDS,              // opcional (registro em várias guilds: "id1,id2,...")
   TZ = 'America/Fortaleza',
 } = process.env;
 
@@ -72,27 +73,24 @@ const qGetSchedule    = db.prepare('SELECT channel_id, time_str FROM schedules W
 const qAllSchedules   = db.prepare('SELECT guild_id FROM schedules');
 
 // -------------------------------
-// Utilidades de data/intervalos
+// Datas / filtros / agregação
 // -------------------------------
 function parseDateLabelToISO(dateLabel, now = DateTime.now().setZone(TZ)) {
-  // Converte "Aug 27" -> "YYYY-MM-DD" (ano heurístico = ano atual; ajusta virada)
   if (!dateLabel) return null;
   const curYear = now.year;
   let dt = DateTime.fromFormat(`${dateLabel} ${curYear}`, 'LLL dd yyyy', { zone: TZ, locale: 'en' });
   if (!dt.isValid) return null;
-  // Se por alguma razão ficou no futuro (virada de ano), recua um ano:
-  if (dt > now.plus({ days: 2 })) dt = dt.minus({ years: 1 });
-  return dt.toISODate(); // YYYY-MM-DD
+  if (dt > now.plus({ days: 2 })) dt = dt.minus({ years: 1 }); // ajuste de virada de ano
+  return dt.toISODate();
 }
 
 function filterBlocksByRange(blocks, range) {
-  // range: 'day' (hoje), 'week' (últimos 7 dias), 'month' (últimos 30 dias)
   const today = DateTime.now().setZone(TZ).startOf('day');
   let start;
   if (range === 'day') start = today;
   else if (range === 'week') start = today.minus({ days: 6 });
   else if (range === 'month') start = today.minus({ days: 29 });
-  else start = today; // default: hoje
+  else start = today;
 
   const end = today.endOf('day');
 
@@ -106,10 +104,10 @@ function filterBlocksByRange(blocks, range) {
 }
 
 function aggregate(blocks) {
-  // Soma kills/deaths e W/L. KD = K_total / D_total (protege divisão por zero).
+  // KD = K_total / D_total (protege divisão por zero)
   // HS% ponderado por kills: (Σ (hs% * K)) / (Σ K)
   let totalK = 0, totalD = 0, totalWins = 0, totalLosses = 0;
-  let hsShotsEst = 0; // aproximação: hs% * kills
+  let hsShotsEst = 0;
 
   for (const b of blocks) {
     if (Number.isFinite(b.k)) totalK += b.k;
@@ -125,19 +123,11 @@ function aggregate(blocks) {
   const kd = Number.isFinite(kdRaw) ? kdRaw : 0;
   const hsPct = totalK > 0 ? (hsShotsEst / totalK) * 100 : 0;
 
-  return {
-    wins: totalWins,
-    losses: totalLosses,
-    k: totalK,
-    d: totalD,
-    kd,
-    hs_pct: hsPct,
-    days: blocks.length,
-  };
+  return { wins: totalWins, losses: totalLosses, k: totalK, d: totalD, kd, hs_pct: hsPct, days: blocks.length };
 }
 
 // -------------------------------
-// Embeds
+/* Embeds */
 // -------------------------------
 function embedReport(rangeTitle, username, url, agg) {
   return new EmbedBuilder()
@@ -154,15 +144,15 @@ function embedReport(rangeTitle, username, url, agg) {
 }
 
 function embedRanking(rangeTitle, rankings) {
-  const fmtList = (title, arr, fmt) =>
-    `**${title}**\n` + (arr.length ? arr.map((r,i)=> `${i===0?'🏆 ':''}${fmt(r)}`).join('\n') : '—');
+  const fmt = (title, arr, f) =>
+    `**${title}**\n` + (arr.length ? arr.map((r, i) => `${i === 0 ? '🏆 ' : ''}${f(r)}`).join('\n') : '—');
 
   const desc = [
-    fmtList('Quem mais matou', rankings.mostKills, (r)=> `**${r.username}** — ${r.k}`),
-    fmtList('Quem mais morreu', rankings.mostDeaths, (r)=> `**${r.username}** — ${r.d}`),
-    fmtList('Melhor K/D', rankings.bestKD, (r)=> `**${r.username}** — ${r.kd.toFixed(2)}`),
-    fmtList('Melhor HS%', rankings.bestHS, (r)=> `**${r.username}** — ${r.hs_pct.toFixed(1)}%`),
-    fmtList('Quem mais venceu', rankings.mostWins, (r)=> `**${r.username}** — ${r.wins}`),
+    fmt('Quem mais matou', rankings.mostKills,  (r)=> `**${r.username}** — ${r.k}`),
+    fmt('Quem mais morreu', rankings.mostDeaths, (r)=> `**${r.username}** — ${r.d}`),
+    fmt('Melhor K/D',      rankings.bestKD,     (r)=> `**${r.username}** — ${r.kd.toFixed(2)}`),
+    fmt('Melhor HS%',      rankings.bestHS,     (r)=> `**${r.username}** — ${r.hs_pct.toFixed(1)}%`),
+    fmt('Quem mais venceu',rankings.mostWins,   (r)=> `**${r.username}** — ${r.wins}`),
   ].join('\n\n');
 
   return new EmbedBuilder()
@@ -200,14 +190,14 @@ function buildRankings(collected) {
     .filter(c => !c.error)
     .map(c => ({ username: c.username, ...c.agg }));
 
-  const desc = (key) => (a,b) => (b[key] - a[key]);
+  const by = (k) => (a,b)=> (b[k] - a[k]);
 
   return {
-    mostKills:  [...flat].sort(desc('k')).slice(0, 5),
-    mostDeaths: [...flat].sort(desc('d')).slice(0, 5),
-    bestKD:     [...flat].sort((a,b)=> (b.kd - a.kd)).slice(0, 5),
-    bestHS:     [...flat].sort((a,b)=> (b.hs_pct - a.hs_pct)).slice(0, 5),
-    mostWins:   [...flat].sort(desc('wins')).slice(0, 5),
+    mostKills:  [...flat].sort(by('k')).slice(0, 5),
+    mostDeaths: [...flat].sort(by('d')).slice(0, 5),
+    bestKD:     [...flat].sort((a,b)=> b.kd - a.kd).slice(0, 5),
+    bestHS:     [...flat].sort((a,b)=> b.hs_pct - a.hs_pct).slice(0, 5),
+    mostWins:   [...flat].sort(by('wins')).slice(0, 5),
   };
 }
 
@@ -229,7 +219,6 @@ async function installCronForGuild(client, guildId) {
   const parsed = parseHHmm(time_str);
   if (!parsed) return;
 
-  // se existe cron anterior, interrompe
   const old = guildCrons.get(guildId);
   if (old) old.stop();
 
@@ -245,17 +234,14 @@ async function installCronForGuild(client, guildId) {
         return;
       }
 
-      // Um embed por jogador
       for (const r of results) {
         if (r.error) {
-          await ch.send(`Falha ao ler **${r.username}** — ${r.err || 'erro'}`);
+          await ch.send(`❌ Falha ao ler **${r.username}** — ${r.err || 'erro'}`);
           continue;
         }
-        const emb = embedReport('Hoje', r.username, r.url, r.agg);
-        await ch.send({ embeds: [emb] });
+        await ch.send({ embeds: [embedReport('Hoje', r.username, r.url, r.agg)] });
       }
 
-      // E o ranking do dia
       const rk = buildRankings(results);
       await ch.send({ embeds: [embedRanking('— Hoje', rk)] });
     } catch (e) {
@@ -273,7 +259,7 @@ async function installAllCrons(client) {
 }
 
 // -------------------------------
-// Discord client + comandos
+// Discord client + slash commands
 // -------------------------------
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
@@ -325,7 +311,6 @@ async function registerSlashCommands() {
   const app = await client.application?.fetch();
   const appId = app?.id || client.user.id;
 
-  // Suporta GUILD_IDS (lista), GUILD_ID (única) ou global
   const list = (GUILD_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
   if (list.length) {
     for (const gid of list) {
@@ -343,7 +328,6 @@ async function registerSlashCommands() {
 
 client.once('ready', async () => {
   console.log(`Logado como ${client.user.tag}`);
-  // Lista guilds conectadas (útil pra descobrir IDs)
   console.log('Guilds conectadas:');
   for (const g of client.guilds.cache.values()) {
     console.log(`- ${g.name} (${g.id})`);
@@ -352,45 +336,75 @@ client.once('ready', async () => {
   await installAllCrons(client);
 });
 
+// -------------------------------
+// Helper de confirmação (acks)
+// -------------------------------
+async function confirm(ix, message, { ephemeral = false, edit = false } = {}) {
+  const payload = typeof message === 'string' ? { content: message } : message;
+
+  if (edit) {
+    return ix.editReply(payload);
+  }
+
+  if (ix.deferred || ix.replied) {
+    return ix.followUp({ ...payload, ephemeral });
+  }
+
+  return ix.reply({ ...payload, ephemeral });
+}
+
+// -------------------------------
+// Handler de comandos (com confirmações)
+// -------------------------------
 client.on('interactionCreate', async (ix) => {
   if (!ix.isChatInputCommand()) return;
 
   const name = ix.commandName;
   const guildId = ix.guildId;
 
-  // --- /cadastrar ---
+  // =============== /cadastrar ===============
   if (name === 'cadastrar') {
     if (!ix.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
-      await ix.reply({ content: 'Apenas admins (Manage Server) podem cadastrar jogadores.', ephemeral: true });
+      await confirm(ix, '❌ Apenas admins (Manage Server) podem cadastrar jogadores.', { ephemeral: true });
       return;
     }
     const nick = ix.options.getString('nick', true).trim();
     qInsertPlayer.run(guildId, nick);
-    await ix.reply(`✅ **${nick}** cadastrado para rastrear neste servidor.`);
+    const total = qListPlayers.all(guildId).length;
+
+    await confirm(
+      ix,
+      `✅ **${nick}** cadastrado para rastrear neste servidor.\n📚 Jogadores cadastrados agora: **${total}**.`,
+      { ephemeral: true }
+    );
     return;
   }
 
-  // --- /programar ---
+  // =============== /programar ===============
   if (name === 'programar') {
     if (!ix.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
-      await ix.reply({ content: 'Apenas admins (Manage Server) podem programar o relatório.', ephemeral: true });
+      await confirm(ix, '❌ Apenas admins (Manage Server) podem programar o relatório.', { ephemeral: true });
       return;
     }
     const channel = ix.options.getChannel('canal', true);
     const horario = ix.options.getString('horario', true);
     const parsed = parseHHmm(horario);
+
     if (!parsed) {
-      await ix.reply({ content: 'Formato inválido. Use **HH:mm** (24h), ex.: 23:55.', ephemeral: true });
+      await confirm(ix, '⚠️ Formato inválido. Use **HH:mm** (24h), ex.: `23:55`.', { ephemeral: true });
       return;
     }
 
+    await confirm(ix, `🗓️ Recebi: vou agendar o envio diário para **${channel}** às **${horario} ${TZ}**…`, { ephemeral: true });
+
     qUpsertSchedule.run(guildId, channel.id, horario);
     await installCronForGuild(client, guildId);
-    await ix.reply(`🗓️ Agendado! Todo dia às **${horario} ${TZ}** eu envio o relatório de **hoje** em ${channel}.`);
+
+    await confirm(ix, `✅ Agendamento criado/atualizado com sucesso!\n• Canal: ${channel}\n• Horário: **${horario} ${TZ}**`, { ephemeral: true });
     return;
   }
 
-  // Map de intervalos
+  // =============== Map de intervalos ===============
   const rangeMap = {
     daily_report:   'day',
     weekly_report:  'week',
@@ -400,45 +414,57 @@ client.on('interactionCreate', async (ix) => {
     monthly_ranking: 'month',
   };
 
+  // =============== Relatórios & Rankings ===============
   if (name in rangeMap) {
-    await ix.deferReply(); // evita timeout do Discord enquanto scrapeia
     const range = rangeMap[name];
+
+    await ix.deferReply(); // público (se quiser privado: { ephemeral: true })
+
+    const label =
+      range === 'day' ? 'de hoje' :
+      range === 'week' ? 'dos últimos 7 dias' :
+      'dos últimos 30 dias';
+
+    await confirm(ix, `🔎 Recebi o comando **/${name}** — gerando ${name.endsWith('report') ? 'relatório' : 'ranking'} ${label}…`);
 
     try {
       const results = await collectForGuild(guildId, range);
+
       if (!results.length) {
-        await ix.editReply('Nenhum jogador cadastrado. Use `/cadastrar nick` primeiro.');
+        await confirm(ix, '⚠️ Nenhum jogador cadastrado. Use `/cadastrar nick` primeiro.', { edit: true });
         return;
       }
 
-      const title =
-        range === 'day'   ? 'Hoje' :
-        range === 'week'  ? 'Últimos 7 dias' :
-                            'Últimos 30 dias';
+      const total = results.length;
+      const ok = results.filter(r => !r.error).length;
+      const fail = total - ok;
 
       if (name.endsWith('report')) {
-        // Envia um embed por jogador
+        const title =
+          range === 'day' ? 'Hoje' :
+          range === 'week' ? 'Últimos 7 dias' : 'Últimos 30 dias';
+
         for (const r of results) {
           if (r.error) {
-            await ix.followUp(`Falha ao ler **${r.username}** — ${r.err || 'erro'}`);
-            continue;
+            await confirm(ix, `❌ Falha ao ler **${r.username}** — ${r.err || 'erro'}`);
+          } else {
+            await confirm(ix, { embeds: [embedReport(title, r.username, r.url, r.agg)] });
           }
-          const emb = embedReport(title, r.username, r.url, r.agg);
-          await ix.followUp({ embeds: [emb] });
         }
-        await ix.editReply('✅ Relatório concluído.');
+
+        await confirm(ix, `✅ Relatório ${label} concluído.\n• Processados: **${ok}/${total}** (erros: ${fail}).`, { edit: true });
       } else {
-        // Ranking
         const rk = buildRankings(results);
-        const emb = embedRanking(
-          range === 'day' ? '— Hoje' : (range === 'week' ? '— Últimos 7 dias' : '— Últimos 30 dias'),
-          rk
-        );
-        await ix.editReply({ embeds: [emb] });
+        const title =
+          range === 'day' ? '— Hoje' :
+          range === 'week' ? '— Últimos 7 dias' : '— Últimos 30 dias';
+
+        await confirm(ix, { embeds: [embedRanking(title, rk)] }, { edit: true });
+        await confirm(ix, `✅ Ranking ${label} gerado.\n• Considerados: **${ok}/${total}** jogadores (erros: ${fail}).`);
       }
     } catch (e) {
       console.error(e);
-      await ix.editReply('Não consegui gerar agora. Tente novamente em alguns minutos.');
+      await confirm(ix, '❌ Não consegui gerar agora. Tente novamente mais tarde.', { edit: true });
     }
     return;
   }
