@@ -83,14 +83,14 @@ const qAllSchedules   = db.prepare('SELECT guild_id FROM schedules');
 const MONTHS_EN = { Jan:1, Feb:2, Mar:3, Apr:4, May:5, Jun:6, Jul:7, Aug:8, Sep:9, Oct:10, Nov:11, Dec:12 };
 
 function toISOFromLabel(label, now = DateTime.now().setZone(TZ)) {
-  // "Aug 29" → "yyyy-MM-dd"
+  // "Aug 28" → "yyyy-MM-dd"
   const m = /^\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\s*$/.exec(label || '');
   if (!m) return null;
   let year = now.year;
   const month = MONTHS_EN[m[1]];
   const day = Number(m[2]);
   let dt = DateTime.fromObject({ year, month, day }, { zone: TZ });
-  // Se estivermos em Jan e o label for Dez, ajusta ano anterior
+  // Se estivermos em Jan e o label for Dez, ajusta para ano anterior
   if (now.month === 1 && month === 12) dt = dt.minus({ years: 1 });
   return dt.toISODate();
 }
@@ -118,7 +118,7 @@ async function scrapeDailyBlocks(username) {
   const $ = cheerio.load(html);
 
   const blocks = [];
-  // Cada "dia" fica em uma seção com header "Aug 29", etc. (layout TRN v3)
+  // Cada "dia" fica em seção com header "Aug 28", etc. (layout TRN v3)
   $('div.col-span-full.grid.grid-cols-subgrid.gap-5').each((_, section) => {
     const header = $(section).find('header .text-18.font-bold.text-secondary').first().text().trim();
     const iso = toISOFromLabel(header);
@@ -188,9 +188,9 @@ function filterBlocksByWindow(blocks, start, end) {
 function filterBlocksByRange(blocks, range, now = DateTime.now().setZone(TZ)) {
   const today = now.startOf('day');
   let start;
-  if (range === 'day') start = today;
-  else if (range === 'week') start = today.minus({ days: 6 });
-  else if (range === 'month') start = today.minus({ days: 29 });
+  if (range === 'day') start = today;                    // hoje
+  else if (range === 'week') start = today.minus({ days: 6 });  // últimos 7
+  else if (range === 'month') start = today.minus({ days: 29 }); // últimos 30
   else start = today;
   const end = today.endOf('day');
   return filterBlocksByWindow(blocks, start, end);
@@ -218,6 +218,12 @@ function getCanonicalWindow(kind, now = DateTime.now().setZone(TZ)) {
   }
   const start = now.startOf('day');
   return { start, end: start.endOf('day') };
+}
+
+// Janela de ONTEM (um único dia civil no fuso TZ)
+function getYesterdayWindow(now = DateTime.now().setZone(TZ)) {
+  const y = now.minus({ days: 1 }).startOf('day');
+  return { start: y, end: y.endOf('day') };
 }
 
 // -------------------------------
@@ -498,6 +504,7 @@ const slashCommands = [
     .addStringOption(o => o.setName('nick').setDescription('Nick Ubisoft (opcional, 1 jogador)').setRequired(false)),
 
   new SlashCommandBuilder().setName('daily_ranking').setDescription('Ranking de HOJE'),
+  new SlashCommandBuilder().setName('yesterday_ranking').setDescription('Ranking de ONTEM'),
   new SlashCommandBuilder().setName('weekly_ranking').setDescription('Ranking dos ÚLTIMOS 7 DIAS'),
   new SlashCommandBuilder().setName('monthly_ranking').setDescription('Ranking dos ÚLTIMOS 30 DIAS'),
 ].map(c => c.toJSON());
@@ -600,7 +607,26 @@ client.on('interactionCreate', async (ix) => {
     return;
   }
 
-  // Map de intervalos
+  // /yesterday_ranking — dia anterior (janela de 1 dia)
+  if (name === 'yesterday_ranking') {
+    await ix.deferReply();
+    const { start, end } = getYesterdayWindow();
+    try {
+      const results = await collectForGuildWindow(guildId, start, end);
+      if (!results.length) {
+        await confirm(ix, '⚠️ Nenhum jogador cadastrado. Use `/cadastrar nick` primeiro.', { edit: true });
+        return;
+      }
+      const rk = buildRankings(results);
+      await confirm(ix, { embeds: [embedRanking('— Ontem', rk)] }, { edit: true });
+    } catch (e) {
+      console.error(e);
+      await confirm(ix, '❌ Não consegui gerar agora. Tente novamente.', { edit: true });
+    }
+    return;
+  }
+
+  // Demais comandos de relatório/ranking (hoje/7/30)
   const rangeMap = {
     daily_report:   'day',
     weekly_report:  'week',
@@ -671,7 +697,7 @@ client.on('interactionCreate', async (ix) => {
 });
 
 // -------------------------------
-// Handler: PREFIXO (inclui !cadastrar)
+// Handler: PREFIXO (inclui !cadastrar e !yesterday_ranking)
 // -------------------------------
 client.on('messageCreate', async (msg) => {
   if (!msg.guild || msg.author.bot) return;
@@ -742,7 +768,23 @@ client.on('messageCreate', async (msg) => {
     return send('🛑 Programações **canceladas** para este servidor.');
   }
 
-  // Map de intervalos
+  // !yesterday_ranking — dia anterior
+  if (cmd === 'yesterday_ranking') {
+    const { start, end } = getYesterdayWindow();
+    await send('🔎 Gerando ranking **de ontem**…');
+    try {
+      const results = await collectForGuildWindow(msg.guild.id, start, end);
+      if (!results.length) return send('⚠️ Nenhum jogador cadastrado. Use `/cadastrar nick` ou `!cadastrar <nick>`.');
+      const rk = buildRankings(results);
+      await send({ embeds: [embedRanking('— Ontem', rk)] });
+      return;
+    } catch (e) {
+      console.error(e);
+      return send('❌ Não consegui gerar agora. Tente novamente em alguns minutos.');
+    }
+  }
+
+  // Map de intervalos (hoje/7/30)
   const rangeMap = {
     'daily_report':   'day',
     'weekly_report':  'week',
@@ -831,6 +873,7 @@ client.on('messageCreate', async (msg) => {
             `**Uso:** \`${PREFIX}programar #canal HH:mm\``,
             `Cria 3 rotinas no mesmo horário:`,
             `• **Diário:** relatório do dia, todos os dias;`,
+            `• **Ontem:** use \`${PREFIX}yesterday_ranking\` sob demanda;`,
             `• **Semanal:** toda **segunda**, ranking da **semana anterior** (seg-dom);`,
             `• **Mensal:** todo **dia 1**, ranking do **mês anterior**.`,
             `Ex.: \`${PREFIX}programar #r6-status 23:55\``,
@@ -856,6 +899,7 @@ client.on('messageCreate', async (msg) => {
           name: `5) Rankings (TODOS)`,
           value: [
             `**Hoje:** \`${PREFIX}daily_ranking\``,
+            `**Ontem:** \`${PREFIX}yesterday_ranking\``,
             `**Semana (7d):** \`${PREFIX}weekly_ranking\``,
             `**Mês (30d):** \`${PREFIX}monthly_ranking\``,
             `Categorias: Quem mais matou • Quem mais morreu • Melhor K/D • Melhor HS% • Quem mais venceu`,
