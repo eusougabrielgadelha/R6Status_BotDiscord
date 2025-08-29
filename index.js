@@ -97,17 +97,84 @@ function toISOFromLabel(label, now = DateTime.now().setZone(TZ)) {
 }
 
 async function fetchProfileHtml(username) {
-  const url = `https://r6.tracker.network/profile/pc/${encodeURIComponent(username)}`;
-  const res = await fetch(url, {
-    headers: {
-      'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml',
-    },
-  });
-  if (!res.ok) throw new Error(`Falha ao carregar perfil ${username}: HTTP ${res.status}`);
-  return { url, html: await res.text() };
+  const cookie = process.env.TRN_COOKIE?.trim();
+  const basePref = (process.env.TRN_BASE || 'auto').toLowerCase();
+
+  const candidates = [];
+  // r6.tracker.network costuma redirecionar para tracker.gg; tentamos ambos
+  const nameEnc = encodeURIComponent(username);
+  const u1 = `https://r6.tracker.network/profile/pc/${nameEnc}`;
+  const u2 = `https://tracker.gg/r6siege/profile/ubisoft/${nameEnc}/overview`;
+  const u3 = `https://tracker.gg/r6siege/profile/pc/${nameEnc}/overview`;
+  if (basePref === 'r6') candidates.push(u1);
+  else if (basePref === 'tracker') candidates.push(u2, u3);
+  else candidates.push(u2, u3, u1); // auto: mais estável primeiro
+
+  // pool de User-Agents reais
+  const UAS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  ];
+
+  const delay = (ms) => new Promise(r => setTimeout(r, ms));
+
+  let lastErr;
+  for (const url of candidates) {
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      const ua = UAS[(attempt - 1) % UAS.length];
+      const headers = {
+        'User-Agent': ua,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9,pt-BR;q=0.8,pt;q=0.7',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+      };
+      if (cookie) headers['Cookie'] = cookie;
+      // alguns bloqueios relaxam com referer/origin
+      const origin = new URL(url).origin;
+      headers['Referer'] = origin + '/';
+      headers['Origin'] = origin;
+
+      try {
+        const res = await fetch(url, { headers, redirect: 'follow' });
+        if (res.status === 403 || res.status === 429 || res.status === 503) {
+          lastErr = new Error(`HTTP ${res.status}`);
+          // espera progressiva antes do retry
+          await delay(600 * attempt + Math.floor(Math.random() * 400));
+          continue;
+        }
+        if (!res.ok) {
+          lastErr = new Error(`HTTP ${res.status}`);
+          break; // tenta próximo domínio
+        }
+        const html = await res.text();
+        // checa se caiu numa página de challenge
+        if (/cf-browser-verification|Attention Required|Just a moment/i.test(html)) {
+          lastErr = new Error('Cloudflare challenge');
+          await delay(700 * attempt);
+          continue;
+        }
+        return { url, html };
+      } catch (e) {
+        lastErr = e;
+        await delay(500 * attempt);
+      }
+    }
+    // próxima opção de domínio
+  }
+
+  const hint = cookie
+    ? 'Verifique se TRN_COOKIE ainda é válido (pode expirar).'
+    : 'Defina TRN_COOKIE no .env (copie o header Cookie do seu navegador no tracker.gg) para evitar 403.';
+  throw new Error(`Falha ao carregar perfil ${username}: ${lastErr?.message || 'bloqueado'} — ${hint}`);
 }
+
 
 /**
  * scrapeDailyBlocks(username)
