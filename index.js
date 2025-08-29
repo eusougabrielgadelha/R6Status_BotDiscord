@@ -672,9 +672,9 @@ function embedRanking(rangeTitle, rankings) {
     fmt('Quem mais venceu', rankings.mostWins, (r) => `**${r.username}** — ${nf(r.wins, 0)}`),
 
     // Extras (se você estiver calculando no aggregate):
-    fmt('Melhor WR%', rankings.highestWR, (r) => `**${r.username}** — ${pct(r.wr)} • ${nf(r.matches, 0)} partidas`),
-    fmt('Melhor KPM', rankings.bestKPM, (r) => `**${r.username}** — ${nf(r.kpm, 2)} • ${nf(r.matches, 0)} partidas`),
-    fmt('Melhor +/− K-D', rankings.bestNet, (r) => `**${r.username}** — ${signed(r.net)}`),
+    fmt('Melhor Win Rate%', rankings.highestWR, (r) => `**${r.username}** — ${pct(r.wr)} • ${nf(r.matches, 0)} partidas`),
+    fmt('Melhor Kill Por Partida', rankings.bestKPM, (r) => `**${r.username}** — ${nf(r.kpm, 2)} • ${nf(r.matches, 0)} partidas`),
+    fmt('Saldo de Kills', rankings.bestNet, (r) => `**${r.username}** — ${signed(r.net)}`),
     fmt('Quem mais jogou', rankings.mostMatches, (r) => `**${r.username}** — ${nf(r.matches, 0)} partidas`),
   ];
 
