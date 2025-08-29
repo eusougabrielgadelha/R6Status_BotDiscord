@@ -350,30 +350,51 @@ function toISOFromLabel(label, now = DateTime.now().setZone(TZ)) {
 
 async function scrapeDailyBlocks(username) {
   const { url, html } = await fetchProfileHtml(username);
-  const $ = cheerio.load(html, { 
-    decodeEntities: false
-  });
-  
+  const $ = cheerio.load(html, { decodeEntities: false });
+
   const blocks = [];
+
+  // Cada "dia" fica em uma seção com grid e gap-5
   $('div.col-span-full.grid.grid-cols-subgrid.gap-5').each((_, section) => {
-    const header = $(section).find('header .text-18.font-bold.text-secondary').first().text().trim();
-    const iso = toISOFromLabel(header);
+    const $sec = $(section);
+
+    // Título do dia, ex.: "Aug 28"
+    const headerLabel =
+      $sec.find('header .text-18.font-bold.text-secondary').first().text().trim() ||
+      $sec.find('header .text-18.font-bold').first().text().trim(); // fallback
+
+    const iso = toISOFromLabel(headerLabel);
     if (!iso) return;
-    
+
+    // Partidas (chip do cabeçalho). Ex.: <span class="v3-chip font-bold">5</span>
+    let matchesFromHeader = parseInt(
+      $sec.find('header .v3-chip.font-bold, header .v3-chip').first().text().trim() || '0',
+      10
+    );
+    if (!Number.isFinite(matchesFromHeader)) matchesFromHeader = 0;
+
     let wins = 0, losses = 0, kSum = 0, dSum = 0;
     let hsAcc = 0, hsN = 0;
-    
-    $(section).find('.v3-match-row').each((__, row) => {
+
+    // Linhas de partidas do dia
+    const $rows = $sec.find('.v3-match-row');
+
+    $rows.each((__, row) => {
       const $row = $(row);
-      const isWin = $row.hasClass('v3-match-row--win');
-      if (isWin) wins++; else losses++;
-      
+
+      // Resultado
+      if ($row.hasClass('v3-match-row--win')) wins++;
+      else if ($row.hasClass('v3-match-row--loss')) losses++;
+
+      // K e D (preferência pelo bloco com "slash")
       const kdList = $row.find('.v3-separate-slash .value');
       let k = 0, d = 0;
+
       if (kdList.length >= 2) {
         k = parseInt($(kdList[0]).text().trim(), 10) || 0;
         d = parseInt($(kdList[1]).text().trim(), 10) || 0;
       } else {
+        // Fallback: tenta ler K/D e reconstruir K e D (menor precisão)
         const kdTxt = $row.find('.stat-name:contains("K/D")').parent().find('.stat-value').first().text().trim();
         const kd = parseFloat(kdTxt.replace(',', '.')) || 0;
         d = kd > 0 ? 1 : 0;
@@ -381,7 +402,8 @@ async function scrapeDailyBlocks(username) {
       }
       kSum += k;
       dSum += d;
-      
+
+      // HS% (média simples das partidas do dia)
       const hsTxt = $row
         .find('.stat-name:contains("HS")')
         .parent()
@@ -391,17 +413,42 @@ async function scrapeDailyBlocks(username) {
         .trim()
         .replace('%', '')
         .replace(',', '.');
+
       const hs = parseFloat(hsTxt);
       if (!Number.isNaN(hs)) {
         hsAcc += hs;
         hsN += 1;
       }
     });
-    
+
+    // Caso o chip não exista, usa a contagem de linhas como partidas
+    const matches = matchesFromHeader || $rows.length || (wins + losses);
+
+    // Se não houver linhas (algumas páginas mostram só o cabeçalho),
+    // tenta extrair W/L do "stat-list" do header como fallback.
+    if ($rows.length === 0) {
+      $sec.find('header .stat-list .value').each((__, el) => {
+        const txt = $(el).text().trim();
+        const n = parseInt(txt.replace(/\D+/g, ''), 10) || 0;
+        if (/W/i.test(txt)) wins = n;
+        if (/L/i.test(txt)) losses = n;
+      });
+    }
+
     const hs_pct = hsN > 0 ? (hsAcc / hsN) : 0;
-    blocks.push({ dateLabel: header, iso, wins, losses, k: kSum, d: dSum, hs_pct });
+
+    blocks.push({
+      dateLabel: headerLabel,
+      iso,
+      wins,
+      losses,
+      k: kSum,
+      d: dSum,
+      hs_pct,
+      matches
+    });
   });
-  
+
   $.root().empty(); // Limpa memória
   return { url, blocks };
 }
@@ -520,24 +567,62 @@ function getYesterdayWindow(now = DateTime.now().setZone(TZ)) {
 
 // Agregação
 function aggregate(blocks) {
-  let totalK = 0, totalD = 0, totalWins = 0, totalLosses = 0;
-  let hsShotsEst = 0;
-  
+  let totalK = 0, totalD = 0, totalWins = 0, totalLosses = 0, totalMatches = 0;
+  let hsWeightedKills = 0;
+
   for (const b of blocks) {
-    if (Number.isFinite(b.k)) totalK += b.k;
-    if (Number.isFinite(b.d)) totalD += b.d;
-    if (Number.isFinite(b.wins)) totalWins += b.wins;
-    if (Number.isFinite(b.losses)) totalLosses += b.losses;
-    if (Number.isFinite(b.hs_pct) && Number.isFinite(b.k)) {
-      hsShotsEst += (b.hs_pct / 100) * b.k;
+    const k = Number.isFinite(b?.k) ? b.k : 0;
+    const d = Number.isFinite(b?.d) ? b.d : 0;
+    const w = Number.isFinite(b?.wins) ? b.wins : 0;
+    const l = Number.isFinite(b?.losses) ? b.losses : 0;
+
+    // matches do scrape; se não vier, usa W+L como fallback
+    const m = Number.isFinite(b?.matches) ? b.matches : (w + l);
+
+    totalK += k;
+    totalD += d;
+    totalWins += w;
+    totalLosses += l;
+    totalMatches += m;
+
+    if (Number.isFinite(b?.hs_pct) && k > 0) {
+      hsWeightedKills += (b.hs_pct / 100) * k;
     }
   }
-  
+
   const kdRaw = totalD > 0 ? totalK / totalD : (totalK > 0 ? Infinity : 0);
   const kd = Number.isFinite(kdRaw) ? kdRaw : 0;
-  const hsPct = totalK > 0 ? (hsShotsEst / totalK) * 100 : 0;
-  
-  return { wins: totalWins, losses: totalLosses, k: totalK, d: totalD, kd, hs_pct: hsPct, days: blocks.length };
+
+  // HS% ponderado por kills (mesma lógica anterior)
+  const hsPct = totalK > 0 ? (hsWeightedKills / totalK) * 100 : 0;
+
+  // Win Rate com melhor fallback
+  const denomWR = (totalWins + totalLosses) || totalMatches;
+  const wr = denomWR > 0 ? (totalWins / denomWR) * 100 : 0;
+
+  // Métricas por partida
+  const kpm = totalMatches > 0 ? totalK / totalMatches : 0;
+  const dpm = totalMatches > 0 ? totalD / totalMatches : 0;
+
+  const net = totalK - totalD;
+
+  return {
+    // compatibilidade com o que os embeds já usam
+    wins: totalWins,
+    losses: totalLosses,
+    k: totalK,
+    d: totalD,
+    kd,
+    hs_pct: hsPct,
+    days: blocks.length,
+
+    // novos campos úteis
+    matches: totalMatches,
+    wr,           // Win Rate em %
+    kpm,          // Kills por match
+    dpm,          // Deaths por match
+    net           // Kills - Deaths
+  };
 }
 
 // Embeds
@@ -556,17 +641,36 @@ function embedReport(rangeTitle, username, url, agg) {
 }
 
 function embedRanking(rangeTitle, rankings) {
-  const fmt = (title, arr, f) =>
-    `**${title}**\n` + (arr.length ? arr.map((r, i) => `${i === 0 ? '🏆 ' : ''}${f(r)}`).join('\n') : '—');
-  
-  const desc = [
-    fmt('Quem mais matou', rankings.mostKills, (r) => `**${r.username}** — ${r.k}`),
-    fmt('Quem menos morreu', rankings.leastDeaths, (r) => `**${r.username}** — ${r.d}`),
-    fmt('Melhor K/D', rankings.bestKD, (r) => `**${r.username}** — ${r.kd.toFixed(2)}`),
-    fmt('Melhor HS%', rankings.bestHS, (r) => `**${r.username}** — ${r.hs_pct.toFixed(1)}%`),
-    fmt('Quem mais venceu', rankings.mostWins, (r) => `**${r.username}** — ${r.wins}`),
-  ].join('\n\n');
-  
+  const nf = (v, d = 0) => Number.isFinite(v) ? Number(v).toFixed(d) : (d ? '0'.padEnd(2 + d, '0') : '0');
+  const pct = (v) => Number.isFinite(v) ? `${Number(v).toFixed(1)}%` : '0%';
+  const signed = (v) => {
+    const n = Number.isFinite(v) ? Math.round(v) : 0;
+    return (n > 0 ? `+${n}` : `${n}`);
+  };
+
+  const fmt = (title, arr, render) =>
+    `**${title}**\n` + (
+      Array.isArray(arr) && arr.length
+        ? arr.map((r, i) => `${i === 0 ? '🏆 ' : ''}${render(r)}`).join('\n')
+        : '—'
+    );
+
+  const descParts = [
+    fmt('Quem mais matou', rankings.mostKills, (r) => `**${r.username}** — ${nf(r.k, 0)}`),
+    fmt('Quem menos morreu', rankings.leastDeaths, (r) => `**${r.username}** — ${nf(r.d, 0)}`),
+    fmt('Melhor K/D', rankings.bestKD, (r) => `**${r.username}** — ${nf(r.kd, 2)}`),
+    fmt('Melhor HS%', rankings.bestHS, (r) => `**${r.username}** — ${pct(r.hs_pct)}`),
+    fmt('Quem mais venceu', rankings.mostWins, (r) => `**${r.username}** — ${nf(r.wins, 0)}`),
+
+    // Extras (se você estiver calculando no aggregate):
+    fmt('Melhor WR%', rankings.highestWR, (r) => `**${r.username}** — ${pct(r.wr)} • ${nf(r.matches, 0)} partidas`),
+    fmt('Melhor KPM', rankings.bestKPM, (r) => `**${r.username}** — ${nf(r.kpm, 2)} • ${nf(r.matches, 0)} partidas`),
+    fmt('Melhor +/− K-D', rankings.bestNet, (r) => `**${r.username}** — ${signed(r.net)}`),
+    fmt('Quem mais jogou', rankings.mostMatches, (r) => `**${r.username}** — ${nf(r.matches, 0)} partidas`),
+  ];
+
+  const desc = descParts.join('\n\n');
+
   return new EmbedBuilder()
     .setTitle(`R6 — Ranking ${rangeTitle}`)
     .setDescription(desc)
@@ -653,24 +757,61 @@ async function collectYesterdayForGuild(guildId) {
 
 // Rankings
 function buildRankings(collected) {
+  // Achata e mantém só quem não falhou
   const flat = collected
     .filter(c => !c.error)
     .map(c => ({ username: c.username, ...c.agg }));
 
-  // Opcional (recomendado): só considera quem jogou algo (K, D, W ou L > 0)
-  const played = flat.filter(p => (p.k + p.d + p.wins + p.losses) > 0);
+  // Considera quem jogou algo (k, d, w ou l)
+  const played = flat.filter(p => (Number(p.k) + Number(p.d) + Number(p.wins) + Number(p.losses)) > 0);
 
-  const by = (k) => (a, b) => (b[k] - a[k]);
+  const safe = (x) => Number.isFinite(x) ? x : 0;
+  const byDesc = (k, tiebreak = []) => (a, b) => {
+    const diff = safe(b[k]) - safe(a[k]);
+    if (diff !== 0) return diff;
+    for (const tk of tiebreak) {
+      const d2 = safe(b[tk]) - safe(a[tk]);
+      if (d2 !== 0) return d2;
+    }
+    return a.username.localeCompare(b.username);
+  };
+  const byAsc = (k, tiebreak = []) => (a, b) => {
+    const diff = safe(a[k]) - safe(b[k]);
+    if (diff !== 0) return diff;
+    for (const tk of tiebreak) {
+      const d2 = safe(a[tk]) - safe(b[tk]);
+      if (d2 !== 0) return d2;
+    }
+    return a.username.localeCompare(b.username);
+  };
+  const top = (arr, n = 6) => arr.slice(0, n);
+
+  // Regras de corte para evitar outliers
+  const MIN_MATCHES = 3;      // para WR/KPM/Net etc.
+  const MIN_KILLS_FOR_HS = 8; // para HS%
+
+  // Conjuntos filtrados
+  const withMatches = played.filter(p => safe(p.matches) >= MIN_MATCHES);
+  const withDeaths  = played.filter(p => safe(p.d) > 0);
+  const forHS       = played.filter(p => safe(p.k) >= MIN_KILLS_FOR_HS);
 
   return {
-    mostKills:   [...played].sort(by('k')).slice(0, 6),
-    leastDeaths: [...played].sort((a, b) => a.d - b.d).slice(0, 6), // << aqui é o novo
-    bestKD:      [...played].sort((a, b) => b.kd - a.kd).slice(0, 6),
-    bestHS:      [...played].sort((a, b) => b.hs_pct - a.hs_pct).slice(0, 6),
-    mostWins:    [...played].sort(by('wins')).slice(0, 5),
+    // Top básicos
+    mostKills:   top([...played].sort(byDesc('k', ['matches', 'wins']))),
+    leastDeaths: top([...played].filter(p => safe(p.matches) > 0).sort(byAsc('d', ['matches']))),
+    mostWins:    top([...played].sort(byDesc('wins', ['matches', 'k']))),
+
+    // Qualidade
+    bestKD:      top([...withDeaths].sort(byDesc('kd', ['k', 'matches']))),
+    bestHS:      top([...forHS].sort(byDesc('hs_pct', ['k', 'matches']))),
+
+    // Novos (se quiser usar nos embeds)
+    highestWR:   top([...withMatches].sort(byDesc('wr', ['matches', 'wins']))),
+    bestKPM:     top([...withMatches].sort(byDesc('kpm', ['matches', 'k']))),
+    bestNet:     top([...withMatches].sort(byDesc('net', ['matches', 'k']))),
+    mostMatches: top([...played].sort(byDesc('matches', ['wins', 'k'])))
   };
 }
-
 
 // Cron management
 const guildCrons = new Map();
