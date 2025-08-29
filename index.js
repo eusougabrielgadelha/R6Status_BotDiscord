@@ -1,12 +1,13 @@
 // index.js
 // ------------------------------------------------------------
-// Bot de Discord para relatórios e rankings de R6 Siege (TRN)
-// - Slash e Prefixo (!)
-// - Relatório individual por nick (opcional)
-// - Crons por guild (horário único):
-//   * Diário  -> envia DAILY_RANKING (apenas ranking do dia)
-//   * Semanal -> toda segunda: WEEKLY_RANKING (semana calendário ANTERIOR)
-//   * Mensal  -> dia 1: MONTHLY_RANKING (mês calendário ANTERIOR)
+// Bot de Discord para R6 Siege (TRN)
+// - Prefixo (!) e Slash (/)
+// - Relatórios individuais (daily/weekly/monthly) com nick opcional
+// - Rankings: daily / yesterday / weekly / monthly
+// - Crons por guild: diário (ranking HOJE), semanal (ranking SEMANA ANTERIOR),
+//   mensal (ranking MÊS ANTERIOR)
+// - Cancelar programação
+// - Help detalhado
 // ------------------------------------------------------------
 
 import 'dotenv/config';
@@ -56,15 +57,14 @@ CREATE TABLE IF NOT EXISTS players (
 );
 
 CREATE TABLE IF NOT EXISTS schedules (
-  guild_id  TEXT NOT NULL,
+  guild_id TEXT NOT NULL,
   channel_id TEXT NOT NULL,
-  time_str  TEXT NOT NULL,     -- "HH:mm" 24h, usado p/ diário/semana/mês
+  time_str TEXT NOT NULL,     -- "HH:mm"
   PRIMARY KEY (guild_id)
 );
 `);
 
 const qInsertPlayer      = db.prepare('INSERT OR IGNORE INTO players (guild_id, username) VALUES (?, ?)');
-const qDeletePlayer      = db.prepare('DELETE FROM players WHERE guild_id = ? AND username = ?');
 const qListPlayers       = db.prepare('SELECT username FROM players WHERE guild_id = ? ORDER BY username COLLATE NOCASE');
 const qUpsertSchedule    = db.prepare(`
   INSERT INTO schedules (guild_id, channel_id, time_str)
@@ -83,23 +83,36 @@ function parseDateLabelToISO(dateLabel, now = DateTime.now().setZone(TZ)) {
   const curYear = now.year;
   let dt = DateTime.fromFormat(`${dateLabel} ${curYear}`, 'LLL dd yyyy', { zone: TZ, locale: 'en' });
   if (!dt.isValid) return null;
-  // proteção virada de ano (ex.: "Jan 01" visto em Dezembro)
+  // proteção virada de ano (ex.: Jan 01 visto no fim do ano)
   if (dt > now.plus({ days: 2 })) dt = dt.minus({ years: 1 });
   return dt.toISODate();
 }
 
-// Últimos 7 / 30 dias (para comandos manuais)
+// Interativo: 'day' (hoje), 'yesterday' (ontem), 'week' (últimos 7d), 'month' (últimos 30d)
 function filterBlocksByRange(blocks, range) {
-  const today = DateTime.now().setZone(TZ).startOf('day');
-  let start;
-  if (range === 'day') start = today;
-  else if (range === 'week') start = today.minus({ days: 6 });
-  else if (range === 'month') start = today.minus({ days: 29 });
-  else start = today;
-  const end = today.endOf('day');
+  const now = DateTime.now().setZone(TZ);
+  const today = now.startOf('day');
+  let start, end;
+
+  if (range === 'day') {
+    start = today;
+    end   = today.endOf('day');
+  } else if (range === 'yesterday') {
+    const y = today.minus({ days: 1 });
+    start = y;
+    end   = y.endOf('day');
+  } else if (range === 'week') {
+    start = today.minus({ days: 6 });
+    end   = today.endOf('day');
+  } else if (range === 'month') {
+    start = today.minus({ days: 29 });
+    end   = today.endOf('day');
+  } else {
+    start = today; end = today.endOf('day');
+  }
 
   return blocks
-    .map(b => ({ ...b, iso: parseDateLabelToISO(b.dateLabel, today) }))
+    .map(b => ({ ...b, iso: parseDateLabelToISO(b.dateLabel, now) }))
     .filter(b => !!b.iso)
     .filter(b => {
       const dt = DateTime.fromISO(b.iso, { zone: TZ });
@@ -107,28 +120,26 @@ function filterBlocksByRange(blocks, range) {
     });
 }
 
-// Semana calendário ANTERIOR (segunda–domingo anteriores)
-function filterBlocksByPreviousCalendarWeek(blocks) {
+// Agendado semanal: semana calendário anterior (seg→dom)
+function filterBlocksByPreviousWeekCalendar(blocks) {
   const now = DateTime.now().setZone(TZ);
-  const startThisWeek = now.startOf('week');        // ISO week => começa na segunda
-  const startPrev     = startThisWeek.minus({ weeks: 1 });
-  const endPrev       = startThisWeek.minus({ days: 1 }).endOf('day');
-
+  const startOfThisWeek = now.startOf('week');           // segunda 00:00
+  const start = startOfThisWeek.minus({ weeks: 1 });     // segunda passada
+  const end   = startOfThisWeek.minus({ days: 1 }).endOf('day'); // domingo passado
   return blocks
     .map(b => ({ ...b, iso: parseDateLabelToISO(b.dateLabel, now) }))
     .filter(b => !!b.iso)
     .filter(b => {
       const dt = DateTime.fromISO(b.iso, { zone: TZ });
-      return dt >= startPrev && dt <= endPrev;
+      return dt >= start && dt <= end;
     });
 }
 
-// Mês calendário ANTERIOR (1º ao último dia)
+// Agendado mensal: mês calendário anterior (1º até último dia)
 function filterBlocksByLastCalendarMonth(blocks) {
   const now = DateTime.now().setZone(TZ);
   const start = now.minus({ months: 1 }).startOf('month');
   const end   = now.minus({ months: 1 }).endOf('month');
-
   return blocks
     .map(b => ({ ...b, iso: parseDateLabelToISO(b.dateLabel, now) }))
     .filter(b => !!b.iso)
@@ -139,7 +150,7 @@ function filterBlocksByLastCalendarMonth(blocks) {
 }
 
 function aggregate(blocks) {
-  // KD = ΣK / ΣD; HS% ponderado por kills = (Σ(HS%·K)) / ΣK
+  // KD = ΣK / ΣD; HS% ponderado = (Σ(HS%·K) / ΣK)·100
   let totalK = 0, totalD = 0, totalWins = 0, totalLosses = 0;
   let hsShotsEst = 0;
 
@@ -153,11 +164,18 @@ function aggregate(blocks) {
     }
   }
 
-  const kdVal = totalD > 0 ? totalK / totalD : (totalK > 0 ? Infinity : 0);
-  const kd = Number.isFinite(kdVal) ? kdVal : 0;
+  const kd = totalD > 0 ? totalK / totalD : (totalK > 0 ? Infinity : 0);
   const hsPct = totalK > 0 ? (hsShotsEst / totalK) * 100 : 0;
 
-  return { wins: totalWins, losses: totalLosses, k: totalK, d: totalD, kd, hs_pct: hsPct, days: blocks.length };
+  return {
+    wins: totalWins,
+    losses: totalLosses,
+    k: totalK,
+    d: totalD,
+    kd: Number.isFinite(kd) ? kd : 0,
+    hs_pct: hsPct,
+    days: blocks.length,
+  };
 }
 
 // -------------------------------
@@ -201,7 +219,6 @@ function buildRankings(collected) {
     .filter(c => !c.error)
     .map(c => ({ username: c.username, ...c.agg }));
 
-  // Tiebreakers simples: kills como desempate secundário
   const sortBy = (key, secondary = 'k') => (a, b) => {
     if (b[key] !== a[key]) return b[key] - a[key];
     return (b[secondary] ?? 0) - (a[secondary] ?? 0);
@@ -217,7 +234,7 @@ function buildRankings(collected) {
 }
 
 // -------------------------------
-// Coleta/Agregação (single e guild)
+// Coleta (user/guild) — cortes diversos
 // -------------------------------
 async function collectForUser(username, range) {
   const { url, blocks } = await scrapeDailyBlocks(username);
@@ -226,9 +243,9 @@ async function collectForUser(username, range) {
   return { username, url, agg, count: filtered.length };
 }
 
-async function collectForUserPrevCalendarWeek(username) {
+async function collectForUserPrevWeek(username) {
   const { url, blocks } = await scrapeDailyBlocks(username);
-  const filtered = filterBlocksByPreviousCalendarWeek(blocks);
+  const filtered = filterBlocksByPreviousWeekCalendar(blocks);
   const agg = aggregate(filtered);
   return { username, url, agg, count: filtered.length };
 }
@@ -254,12 +271,12 @@ async function collectForGuild(guildId, range) {
   return results;
 }
 
-async function collectForGuildPrevCalendarWeek(guildId) {
+async function collectForGuildPreviousWeekCalendar(guildId) {
   const rows = qListPlayers.all(guildId);
   const results = [];
   for (const r of rows) {
     try {
-      const one = await collectForUserPrevCalendarWeek(r.username);
+      const one = await collectForUserPrevWeek(r.username);
       results.push(one);
     } catch (e) {
       results.push({ username: r.username, error: true, err: e?.message || String(e) });
@@ -310,52 +327,48 @@ async function installCronsForGuild(client, guildId) {
   const parsed = parseHHmm(time_str);
   if (!parsed) return;
 
-  // Pare crons antigos (se houver)
+  // zera crons antigos
   stopCronsForGuild(guildId);
 
   const tasks = {};
   const minute = `${parsed.mm}`;
   const hour   = `${parsed.hh}`;
 
-  // Diário: agora envia APENAS o RANKING DO DIA
+  // DIÁRIO → RANKING DO DIA
   const exprDaily = `${minute} ${hour} * * *`;
   tasks.daily = cron.schedule(exprDaily, async () => {
     try {
       const ch = await client.channels.fetch(channel_id);
       if (!ch?.isTextBased()) return;
 
-      const results = await collectForGuild(guildId, 'day'); // hoje
-      if (!results.length) {
-        await ch.send('Nenhum jogador cadastrado. Use `/cadastrar nick`.');
-        return;
-      }
+      const results = await collectForGuild(guildId, 'day');
+      if (!results.length) return ch.send('Nenhum jogador cadastrado. Use `/cadastrar nick`.');
+
       const rk = buildRankings(results);
       await ch.send({ embeds: [embedRanking('— Hoje', rk)] });
     } catch (e) {
-      console.error('Falha no cron diário:', e);
+      console.error('Falha no cron diário (ranking):', e);
     }
   }, { timezone: TZ });
 
-  // Semanal: toda segunda → RANKING semanal (SEMANA CALENDÁRIO ANTERIOR)
+  // SEMANAL (segunda) → RANKING da SEMANA ANTERIOR (seg→dom)
   const exprWeekly = `${minute} ${hour} * * 1`;
   tasks.weekly = cron.schedule(exprWeekly, async () => {
     try {
       const ch = await client.channels.fetch(channel_id);
       if (!ch?.isTextBased()) return;
 
-      const results = await collectForGuildPrevCalendarWeek(guildId);
-      if (!results.length) {
-        await ch.send('Nenhum jogador cadastrado. Use `/cadastrar nick`.');
-        return;
-      }
+      const results = await collectForGuildPreviousWeekCalendar(guildId);
+      if (!results.length) return ch.send('Nenhum jogador cadastrado. Use `/cadastrar nick`.');
+
       const rk = buildRankings(results);
       await ch.send({ embeds: [embedRanking('— Semana (semana anterior)', rk)] });
     } catch (e) {
-      console.error('Falha no cron semanal:', e);
+      console.error('Falha no cron semanal (ranking):', e);
     }
   }, { timezone: TZ });
 
-  // Mensal: dia 1 → RANKING mensal (MÊS CALENDÁRIO ANTERIOR)
+  // MENSAL (dia 1) → RANKING do MÊS ANTERIOR (mês calendário)
   const exprMonthly = `${minute} ${hour} 1 * *`;
   tasks.monthly = cron.schedule(exprMonthly, async () => {
     try {
@@ -363,19 +376,17 @@ async function installCronsForGuild(client, guildId) {
       if (!ch?.isTextBased()) return;
 
       const results = await collectForGuildLastMonthCalendar(guildId);
-      if (!results.length) {
-        await ch.send('Nenhum jogador cadastrado. Use `/cadastrar nick`.');
-        return;
-      }
+      if (!results.length) return ch.send('Nenhum jogador cadastrado. Use `/cadastrar nick`.');
+
       const rk = buildRankings(results);
       await ch.send({ embeds: [embedRanking('— Mês (mês anterior)', rk)] });
     } catch (e) {
-      console.error('Falha no cron mensal:', e);
+      console.error('Falha no cron mensal (ranking):', e);
     }
   }, { timezone: TZ });
 
   guildCrons.set(guildId, tasks);
-  console.log(`Crons instalados p/ guild ${guildId} @ ${time_str} (${TZ}) [daily=ranking, weekly=ranking prev week, monthly=ranking prev month]`);
+  console.log(`Crons instalados @ ${time_str} (${TZ}) para guild ${guildId} [daily=hoje, weekly=semana anterior, monthly=mês anterior]`);
 }
 
 async function installAllCrons(client) {
@@ -405,7 +416,7 @@ const slashCommands = [
 
   new SlashCommandBuilder()
     .setName('programar')
-    .setDescription('Programar envios: diário (ranking), semanal (ranking anterior) e mensal (ranking mês anterior)')
+    .setDescription('Programar: diário (ranking hoje), semanal (ranking semana anterior), mensal (ranking mês anterior)')
     .addChannelOption(o =>
       o.setName('canal').setDescription('Canal de destino').addChannelTypes(ChannelType.GuildText).setRequired(true)
     )
@@ -435,6 +446,7 @@ const slashCommands = [
     .addStringOption(o => o.setName('nick').setDescription('Nick Ubisoft (opcional)').setRequired(false)),
 
   new SlashCommandBuilder().setName('daily_ranking').setDescription('Ranking de HOJE'),
+  new SlashCommandBuilder().setName('yesterday_ranking').setDescription('Ranking de ONTEM'),
   new SlashCommandBuilder().setName('weekly_ranking').setDescription('Ranking dos ÚLTIMOS 7 DIAS'),
   new SlashCommandBuilder().setName('monthly_ranking').setDescription('Ranking do MÊS (últimos 30 dias)'),
 ].map(c => c.toJSON());
@@ -461,7 +473,6 @@ async function registerSlashCommands() {
 
 client.once('ready', async () => {
   console.log(`Logado como ${client.user.tag}`);
-  console.log('Guilds conectadas:');
   for (const g of client.guilds.cache.values()) {
     console.log(`- ${g.name} (${g.id})`);
   }
@@ -470,7 +481,7 @@ client.once('ready', async () => {
 });
 
 // -------------------------------
-// Helper de confirmação (acks para slash)
+// Helper de confirmação (slash)
 // -------------------------------
 async function confirm(ix, message, { ephemeral = false, edit = false } = {}) {
   const payload = typeof message === 'string' ? { content: message } : message;
@@ -510,10 +521,10 @@ client.on('interactionCreate', async (ix) => {
     const parsed = parseHHmm(horario);
     if (!parsed) return confirm(ix, '⚠️ Use **HH:mm** (24h), ex.: `23:55`.', { ephemeral: true });
 
-    await confirm(ix, `🗓️ Programando: diário (ranking), semanal (ranking semana anterior) e mensal (ranking mês anterior) às **${horario} ${TZ}** em ${channel}…`, { ephemeral: true });
+    await confirm(ix, `🗓️ Programando: diário (ranking hoje), semanal (ranking semana anterior) e mensal (ranking mês anterior) às **${horario} ${TZ}** em ${channel}…`, { ephemeral: true });
     qUpsertSchedule.run(guildId, channel.id, horario);
     await installCronsForGuild(client, guildId);
-    await confirm(ix, `✅ Programação criada/atualizada!\n• Canal: ${channel}\n• Horário base: **${horario} ${TZ}**`, { ephemeral: true });
+    await confirm(ix, `✅ Programação criada/atualizada!\n• Canal: ${channel}\n• Horário: **${horario} ${TZ}**`, { ephemeral: true });
     return;
   }
 
@@ -529,31 +540,37 @@ client.on('interactionCreate', async (ix) => {
   }
 
   const rangeMap = {
-    daily_report:   'day',
-    weekly_report:  'week',
-    monthly_report: 'month',
-    daily_ranking:   'day',
-    weekly_ranking:  'week',
-    monthly_ranking: 'month',
+    daily_report:     'day',
+    weekly_report:    'week',
+    monthly_report:   'month',
+    daily_ranking:     'day',
+    yesterday_ranking: 'yesterday',
+    weekly_ranking:    'week',
+    monthly_ranking:   'month',
   };
 
   if (name in rangeMap) {
     const range = rangeMap[name];
     await ix.deferReply();
     const isReport = name.endsWith('report');
+
     const label =
-      range === 'day' ? 'de hoje' :
-      range === 'week' ? 'dos últimos 7 dias' :
+      range === 'day'       ? 'de hoje' :
+      range === 'yesterday' ? 'de ontem' :
+      range === 'week'      ? 'dos últimos 7 dias' :
       'dos últimos 30 dias';
 
-    // Relatório individual (se nick fornecido)
+    // relatório de 1 nick (opcional)
     const nickOpt = isReport ? ix.options.getString('nick') : null;
     if (isReport && nickOpt) {
       const nick = nickOpt.trim();
       await confirm(ix, `🔎 Gerando relatório ${label} de **${nick}**…`);
       try {
         const r = await collectForUser(nick, range);
-        const title = range === 'day' ? 'Hoje' : range === 'week' ? 'Últimos 7 dias' : 'Últimos 30 dias';
+        const title =
+          range === 'day'       ? 'Hoje' :
+          range === 'yesterday' ? 'Ontem' :
+          range === 'week'      ? 'Últimos 7 dias' : 'Últimos 30 dias';
         await confirm(ix, { embeds: [embedReport(title, r.username, r.url, r.agg)] }, { edit: true });
         await confirm(ix, `✅ Relatório ${label} de **${nick}** concluído.`);
       } catch (e) {
@@ -563,7 +580,7 @@ client.on('interactionCreate', async (ix) => {
       return;
     }
 
-    // Fluxo "todos"
+    // rankings e relatórios com todos
     await confirm(ix, `🔎 Gerando ${isReport ? 'relatório' : 'ranking'} ${label}…`);
     try {
       const results = await collectForGuild(guildId, range);
@@ -574,7 +591,10 @@ client.on('interactionCreate', async (ix) => {
       const fail = total - ok;
 
       if (isReport) {
-        const title = range === 'day' ? 'Hoje' : range === 'week' ? 'Últimos 7 dias' : 'Últimos 30 dias';
+        const title =
+          range === 'day'       ? 'Hoje' :
+          range === 'yesterday' ? 'Ontem' :
+          range === 'week'      ? 'Últimos 7 dias' : 'Últimos 30 dias';
         for (const r of results) {
           if (r.error) await confirm(ix, `❌ Falha em **${r.username}** — ${r.err || 'erro'}`);
           else await confirm(ix, { embeds: [embedReport(title, r.username, r.url, r.agg)] });
@@ -582,7 +602,10 @@ client.on('interactionCreate', async (ix) => {
         await confirm(ix, `✅ Relatório ${label} concluído. **${ok}/${total}** (erros: ${fail}).`, { edit: true });
       } else {
         const rk = buildRankings(results);
-        const title = range === 'day' ? '— Hoje' : range === 'week' ? '— Últimos 7 dias' : '— Últimos 30 dias';
+        const title =
+          range === 'day'       ? '— Hoje' :
+          range === 'yesterday' ? '— Ontem' :
+          range === 'week'      ? '— Últimos 7 dias' : '— Últimos 30 dias';
         await confirm(ix, { embeds: [embedRanking(title, rk)] }, { edit: true });
         await confirm(ix, `✅ Ranking ${label} gerado. Considerados: **${ok}/${total}** (erros: ${fail}).`);
       }
@@ -594,7 +617,7 @@ client.on('interactionCreate', async (ix) => {
 });
 
 // -------------------------------
-// Handler: PREFIXO (mensagens)
+// Handler: PREFIXO (!)
 // -------------------------------
 client.on('messageCreate', async (msg) => {
   if (!msg.guild || msg.author.bot) return;
@@ -607,7 +630,7 @@ client.on('messageCreate', async (msg) => {
   const isAdmin = msg.member?.permissions?.has(PermissionFlagsBits.ManageGuild);
   const send = (m) => msg.channel.send(m);
 
-  // Cadastrar (admin)
+  // ADMIN: cadastrar
   if (cmd === 'cadastrar') {
     if (!isAdmin) return send('❌ Apenas admins (Manage Server) podem usar `!cadastrar`.');
     const nick = args.join(' ').trim();
@@ -617,7 +640,7 @@ client.on('messageCreate', async (msg) => {
     return send(`✅ **${nick}** cadastrado. Jogadores agora: **${total}**.`);
   }
 
-  // Programar (admin)
+  // ADMIN: programar (1 horário para 3 crons)
   if (cmd === 'programar') {
     if (!isAdmin) return send('❌ Apenas admins (Manage Server) podem usar `!programar`.');
     if (args.length < 2 && !msg.mentions.channels.first()) {
@@ -635,7 +658,7 @@ client.on('messageCreate', async (msg) => {
         if (target) args.shift();
       }
     } else {
-      args.shift(); // remove a menção para sobrar só o horário
+      args.shift();
     }
 
     const horario = (args[0] || '').trim();
@@ -644,13 +667,13 @@ client.on('messageCreate', async (msg) => {
       return send(`Uso: \`${PREFIX}programar #canal HH:mm\` (ex.: \`${PREFIX}programar #r6-status 23:55\`)`);
     }
 
-    await send(`🗓️ Programando: diário (ranking), semanal (ranking semana anterior) e mensal (ranking mês anterior) às **${horario} ${TZ}** em ${target}…`);
+    await send(`🗓️ Programando: diário (ranking hoje), semanal (ranking semana anterior às seg), mensal (ranking mês anterior) às **${horario} ${TZ}** em ${target}…`);
     qUpsertSchedule.run(msg.guild.id, target.id, horario);
     await installCronsForGuild(client, msg.guild.id);
-    return send(`✅ Programação criada/atualizada!\n• Canal: ${target}\n• Horário base: **${horario} ${TZ}**`);
+    return send(`✅ Programação criada/atualizada!\n• Canal: ${target}\n• Horário: **${horario} ${TZ}**`);
   }
 
-  // Cancelar programação (admin)
+  // ADMIN: cancelar programação
   if (cmd === 'cancelar-programação' || cmd === 'cancelar_programacao') {
     if (!isAdmin) return send('❌ Apenas admins (Manage Server) podem usar `!cancelar-programação`.');
     qDeleteSchedule.run(msg.guild.id);
@@ -660,27 +683,36 @@ client.on('messageCreate', async (msg) => {
 
   // Map de intervalos
   const rangeMap = {
-    'daily_report':   'day',
-    'weekly_report':  'week',
-    'monthly_report': 'month',
-    'daily_ranking':   'day',
-    'weekly_ranking':  'week',
-    'monthly_ranking': 'month',
+    'daily_report':     'day',
+    'weekly_report':    'week',
+    'monthly_report':   'month',
+    'daily_ranking':     'day',
+    'yesterday_ranking': 'yesterday',
+    'weekly_ranking':    'week',
+    'monthly_ranking':   'month',
   };
 
   if (cmd in rangeMap) {
     const range = rangeMap[cmd];
     const isReport = cmd.endsWith('report');
-    const label = range === 'day' ? 'de hoje' : range === 'week' ? 'dos últimos 7 dias' : 'dos últimos 30 dias';
 
-    // Relatório de 1 nick (se informado)
+    const label =
+      range === 'day'       ? 'de hoje' :
+      range === 'yesterday' ? 'de ontem' :
+      range === 'week'      ? 'dos últimos 7 dias' :
+      'dos últimos 30 dias';
+
+    // Relatório individual se informado nick
     const singleNick = isReport && args.length ? args.join(' ').trim() : null;
 
     if (singleNick) {
       await send(`🔎 Gerando relatório ${label} de **${singleNick}**…`);
       try {
         const r = await collectForUser(singleNick, range);
-        const title = range === 'day' ? 'Hoje' : range === 'week' ? 'Últimos 7 dias' : 'Últimos 30 dias';
+        const title =
+          range === 'day'       ? 'Hoje' :
+          range === 'yesterday' ? 'Ontem' :
+          range === 'week'      ? 'Últimos 7 dias' : 'Últimos 30 dias';
         await send({ embeds: [embedReport(title, r.username, r.url, r.agg)] });
         await send(`✅ Relatório ${label} de **${singleNick}** concluído.`);
       } catch (e) {
@@ -690,52 +722,52 @@ client.on('messageCreate', async (msg) => {
       return;
     }
 
-    // Todos os cadastrados
+    // Rankings e relatórios com todos
     await send(`🔎 Gerando ${isReport ? 'relatório' : 'ranking'} ${label}…`);
     try {
       const results = await collectForGuild(msg.guild.id, range);
       if (!results.length) return send('⚠️ Nenhum jogador cadastrado. Use `/cadastrar nick` ou `!cadastrar <nick>`.');
 
-      const total = results.length;
-      const ok = results.filter(r => !r.error).length;
-      const fail = total - ok;
-
       if (isReport) {
-        const title = range === 'day' ? 'Hoje' : range === 'week' ? 'Últimos 7 dias' : 'Últimos 30 dias';
+        const title =
+          range === 'day'       ? 'Hoje' :
+          range === 'yesterday' ? 'Ontem' :
+          range === 'week'      ? 'Últimos 7 dias' : 'Últimos 30 dias';
         for (const r of results) {
           if (r.error) await send(`❌ Falha em **${r.username}** — ${r.err || 'erro'}`);
           else await send({ embeds: [embedReport(title, r.username, r.url, r.agg)] });
         }
-        await send(`✅ Relatório ${label} concluído. **${ok}/${total}** (erros: ${fail}).`);
+        return send(`✅ Relatório ${label} concluído. Considerados: **${results.filter(r=>!r.error).length}/${results.length}**.`);
       } else {
         const rk = buildRankings(results);
-        const title = range === 'day' ? '— Hoje' : range === 'week' ? '— Últimos 7 dias' : '— Últimos 30 dias';
+        const title =
+          range === 'day'       ? '— Hoje' :
+          range === 'yesterday' ? '— Ontem' :
+          range === 'week'      ? '— Últimos 7 dias' : '— Últimos 30 dias';
         await send({ embeds: [embedRanking(title, rk)] });
-        await send(`✅ Ranking ${label} gerado. Considerados: **${ok}/${total}** (erros: ${fail}).`);
+        return send(`✅ Ranking ${label} gerado. Considerados: **${results.filter(r=>!r.error).length}/${results.length}**.`);
       }
     } catch (e) {
       console.error(e);
-      await send('❌ Não consegui gerar agora. Tente novamente em alguns minutos.');
+      return send('❌ Não consegui gerar agora. Tente novamente em alguns minutos.');
     }
-    return;
   }
 
-  // Ajuda detalhada (prefixo)
+  // Help detalhado
   if (cmd === 'help' || cmd === 'ajuda') {
     const eb = new EmbedBuilder()
       .setTitle('R6 — Ajuda (comandos por prefixo)')
       .setDescription([
-        `Prefixo: **${PREFIX}** | Fuso: **${TZ}**.`,
+        `Prefixo: **${PREFIX}** | Fuso: **${TZ}**`,
         `Alguns comandos exigem permissão **Manage Server** (admins).`,
-        `Há equivalentes por *slash* (/daily_report, /weekly_report, etc.).`,
+        `Versões *slash* também estão disponíveis.`,
       ].join('\n'))
       .addFields(
         {
           name: `1) Cadastrar jogador (ADMIN)`,
           value: [
             `**Uso:** \`${PREFIX}cadastrar <nick-ubisoft>\``,
-            `Nick é o da URL no TRN. Ex.: .../ubi/**gabrielgadelham**/overview`,
-            `**Ex.:** \`${PREFIX}cadastrar gabrielgadelham\``,
+            `Nick é o usado na URL do TRN (ex.: .../ubi/**gabrielgadelham**/overview).`,
           ].join('\n'),
           inline: false
         },
@@ -743,26 +775,24 @@ client.on('messageCreate', async (msg) => {
           name: `2) Programar (ADMIN)`,
           value: [
             `**Uso:** \`${PREFIX}programar #canal HH:mm\``,
-            `Cria 3 agendamentos usando **o mesmo horário**:`,
+            `Cria 3 agendamentos usando **um único horário**:`,
             `• **Diário**: envia **ranking do dia**`,
-            `• **Semanal (segunda)**: envia **ranking da semana calendário anterior**`,
-            `• **Mensal (dia 1)**: envia **ranking do mês calendário anterior**`,
-            `**Ex.:** \`${PREFIX}programar #r6-status 23:55\``,
+            `• **Semanal**: toda **segunda** → **ranking da semana anterior** (seg→dom)`,
+            `• **Mensal**: todo **dia 1** → **ranking do mês anterior** (mês calendário)`,
           ].join('\n'),
           inline: false
         },
         {
           name: `3) Cancelar programação (ADMIN)`,
-          value: `**Uso:** \`${PREFIX}cancelar-programação\` (ou \`${PREFIX}cancelar_programacao\`)\nRemove todos os envios programados da guild.`,
+          value: `**Uso:** \`${PREFIX}cancelar-programação\` (ou \`${PREFIX}cancelar_programacao\`) — remove todos os envios programados.`,
           inline: false
         },
         {
           name: `4) Relatórios (TODOS)`,
           value: [
-            `**Hoje:** \`${PREFIX}daily_report [nick]\``,
-            `**Semana (7d rolling):** \`${PREFIX}weekly_report [nick]\``,
-            `**Mês (30d rolling):** \`${PREFIX}monthly_report [nick]\``,
-            `• Se informar \`[nick]\`, gera **apenas** desse jogador; sem nick, **todos os cadastrados**.`,
+            `**Hoje:** \`${PREFIX}daily_report [nick]\`  — \`${PREFIX}daily_report gabrielgadelham\``,
+            `**Semana (7d):** \`${PREFIX}weekly_report [nick]\``,
+            `**Mês (30d):** \`${PREFIX}monthly_report [nick]\``,
           ].join('\n'),
           inline: false
         },
@@ -770,10 +800,20 @@ client.on('messageCreate', async (msg) => {
           name: `5) Rankings (TODOS)`,
           value: [
             `**Hoje:** \`${PREFIX}daily_ranking\``,
-            `**Semana (7d rolling):** \`${PREFIX}weekly_ranking\``,
-            `**Mês (30d rolling):** \`${PREFIX}monthly_ranking\``,
+            `**Ontem:** \`${PREFIX}yesterday_ranking\``,
+            `**Semana (7d):** \`${PREFIX}weekly_ranking\``,
+            `**Mês (30d):** \`${PREFIX}monthly_ranking\``,
             `Categorias: **Quem mais matou**, **Quem mais morreu**, **Melhor K/D**, **Melhor HS%**, **Quem mais venceu**.`,
-            `Obs.: os agendamentos usam **semana/mês calendário anterior**; os comandos manuais usam janelas móveis (7/30 dias).`,
+          ].join('\n'),
+          inline: false
+        },
+        {
+          name: `Notas de cálculo`,
+          value: [
+            `• KD = ΣK/ΣD (desempate por K)`,
+            `• HS% ponderado por K = (Σ(HS%·K)/ΣK)·100`,
+            `• Semana anterior (agendado): segunda a domingo passados`,
+            `• Mês anterior (agendado): mês calendário fechado`,
           ].join('\n'),
           inline: false
         }
