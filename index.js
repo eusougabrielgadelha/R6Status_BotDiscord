@@ -561,7 +561,7 @@ function embedRanking(rangeTitle, rankings) {
   
   const desc = [
     fmt('Quem mais matou', rankings.mostKills, (r) => `**${r.username}** — ${r.k}`),
-    fmt('Quem mais morreu', rankings.mostDeaths, (r) => `**${r.username}** — ${r.d}`),
+    fmt('Quem menos morreu', rankings.leastDeaths, (r) => `**${r.username}** — ${r.d}`),
     fmt('Melhor K/D', rankings.bestKD, (r) => `**${r.username}** — ${r.kd.toFixed(2)}`),
     fmt('Melhor HS%', rankings.bestHS, (r) => `**${r.username}** — ${r.hs_pct.toFixed(1)}%`),
     fmt('Quem mais venceu', rankings.mostWins, (r) => `**${r.username}** — ${r.wins}`),
@@ -656,17 +656,21 @@ function buildRankings(collected) {
   const flat = collected
     .filter(c => !c.error)
     .map(c => ({ username: c.username, ...c.agg }));
-  
+
+  // Opcional (recomendado): só considera quem jogou algo (K, D, W ou L > 0)
+  const played = flat.filter(p => (p.k + p.d + p.wins + p.losses) > 0);
+
   const by = (k) => (a, b) => (b[k] - a[k]);
-  
+
   return {
-    mostKills: [...flat].sort(by('k')).slice(0, 5),
-    mostDeaths: [...flat].sort(by('d')).slice(0, 5),
-    bestKD: [...flat].sort((a, b) => b.kd - a.kd).slice(0, 5),
-    bestHS: [...flat].sort((a, b) => b.hs_pct - a.hs_pct).slice(0, 5),
-    mostWins: [...flat].sort(by('wins')).slice(0, 5),
+    mostKills:   [...played].sort(by('k')).slice(0, 6),
+    leastDeaths: [...played].sort((a, b) => a.d - b.d).slice(0, 6), // << aqui é o novo
+    bestKD:      [...played].sort((a, b) => b.kd - a.kd).slice(0, 6),
+    bestHS:      [...played].sort((a, b) => b.hs_pct - a.hs_pct).slice(0, 6),
+    mostWins:    [...played].sort(by('wins')).slice(0, 5),
   };
 }
+
 
 // Cron management
 const guildCrons = new Map();
