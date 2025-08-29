@@ -267,6 +267,9 @@ async function fetchWithPlaywright(url) {
       waitUntil: 'domcontentloaded', 
       timeout: parseInt(TRN_NAV_TIMEOUT_MS, 10) || 30000 
     });
+
+    // Dentro de fetchWithPlaywright, logo após o goto():
+    await page.waitForSelector('header .stat-list .value, header .name-value .stat-name .truncate', { timeout: 10000 }).catch(() => {});
     
     // Aguarda inicial
     await page.waitForTimeout(2000);
@@ -409,29 +412,43 @@ function yesterdayLabel(now = DateTime.now().setZone(TZ)) {
 }
 
 function findHeaderForLabel($, label) {
+  label = String(label).trim().toLowerCase(); // ex.: "Aug 28"
   let target = null;
+
   $('header').each((_, el) => {
-    const txt = $(el).find('div[class*="text-18"][class*="font-bold"][class*="text-secondary"]').first().text().trim();
-    if (txt.toLowerCase() === String(label).toLowerCase()) {
+    const title = $(el).find('div.text-18.font-bold.text-secondary').first().text().trim();
+    if (title && title.trim().toLowerCase() === label) {
       target = $(el);
       return false;
     }
+    // Fallback: se mudarem as classes, pegue o primeiro <div> do header e compare texto
+    const fallback = $(el).find('div').first().text().trim();
+    if (!target && fallback && fallback.toLowerCase() === label) {
+      target = $(el);
+    }
   });
+
   return target;
 }
 
+
 function readHeaderNumber($, header, key) {
-  const name = header
-    .find('.stat-hor .name-value .stat-name .truncate')
-    .filter((_, el) => $(el).text().trim() === key)
-    .first()
-    .closest('.name-value');
-  
-  if (!name.length) return NaN;
-  const raw = name.find('.stat-value .truncate').first().text().trim();
-  const clean = raw.replace('%', '').trim().replace(',', '.');
-  return Number(clean);
+  // acha o bloco cujo rótulo (stat-name) é exatamente a "key"
+  const row = header.find('.name-value').filter((_, el) =>
+    $(el).find('.stat-name .truncate').first().text().trim() === key
+  ).first();
+
+  if (!row.length) return NaN;
+
+  // pega todo o texto do valor, sem depender de `.truncate`
+  const raw = row.find('.stat-value').first().text().trim();
+
+  // normaliza e extrai o primeiro número (suporta "45.0%", "1,25", espaços, etc.)
+  const cleaned = raw.replace('%', '').replace(',', '.');
+  const match = cleaned.match(/-?\d+(\.\d+)?/);
+  return match ? Number(match[0]) : NaN;
 }
+
 
 function extractDayStatsFromHtml(html, label) {
   const $ = cheerio.load(html);
