@@ -238,9 +238,9 @@ const PLATFORM = PLATFORM_ALIASES[String(TRN_PLATFORM || 'pc').toLowerCase()] ||
 function buildCandidates(username) {
   const nameEnc = encodeURIComponent(username);
   
-  const uTrkUbiOverview = `https://tracker.gg/r6siege/profile/ubisoft/${nameEnc}/matches`;
+  const uTrkUbiOverview = `https://tracker.gg/r6siege/profile/ubi/${nameEnc}/matches`;
   const uTrkPlatOverview = `https://tracker.gg/r6siege/profile/${PLATFORM}/${nameEnc}/overview`;
-  const uR6UbiMatches = `https://r6.tracker.network/r6siege/profile/ubi/${nameEnc}/matches`;
+  const uR6UbiMatches = `https://tracker.gg/r6siege/profile/ubi/${nameEnc}/overview`;
   const uR6PlatProfile = `https://r6.tracker.network/profile/${PLATFORM}/${nameEnc}`;
   
   let candidates;
