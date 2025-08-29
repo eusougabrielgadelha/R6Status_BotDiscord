@@ -501,7 +501,8 @@ function extractDayStatsFromHtml(html, label) {
   const $ = cheerio.load(html);
   const header = findHeaderForLabel($, label);
   if (!header || !header.length) return null;
-  
+
+  // W/L no header
   let wins = 0, losses = 0;
   header.find('.stat-list .value').each((_, el) => {
     const txt = $(el).text().trim();
@@ -509,14 +510,22 @@ function extractDayStatsFromHtml(html, label) {
     if (/W/i.test(txt)) wins = n;
     if (/L/i.test(txt)) losses = n;
   });
-  
+
+  // Chip de partidas (ex.: <span class="v3-chip font-bold">5</span>)
+  let matches = parseInt(
+    header.find('.v3-chip.font-bold, .v3-chip').first().text().trim(), 10
+  );
+  if (!Number.isFinite(matches)) matches = (wins + losses);
+
+  // Demais números do header
   const kd = readHeaderNumber($, header, 'K/D');
-  const k = readHeaderNumber($, header, 'K');
-  const d = readHeaderNumber($, header, 'D');
+  const k  = readHeaderNumber($, header, 'K');
+  const d  = readHeaderNumber($, header, 'D');
   const hs = readHeaderNumber($, header, 'HS%');
-  
-  return { wins, losses, k, d, kd, hs };
+
+  return { wins, losses, k, d, kd, hs, matches };
 }
+
 
 // Filtros de janela temporal
 function filterBlocksByWindow(blocks, start, end) {
@@ -727,6 +736,14 @@ async function collectYesterdayForUser(username) {
   const label = yesterdayLabel();
   const stats = extractDayStatsFromHtml(html, label);
   if (!stats) throw new Error(`Sem bloco de "${label}"`);
+
+  const matches = Number.isFinite(stats.matches) ? stats.matches : ((stats.wins + stats.losses) || 0);
+  const denomWR = (stats.wins + stats.losses) || matches;
+  const wr  = denomWR > 0 ? (stats.wins / denomWR) * 100 : 0;
+  const kpm = matches > 0 ? stats.k / matches : 0;
+  const dpm = matches > 0 ? stats.d / matches : 0;
+  const net = (Number(stats.k) || 0) - (Number(stats.d) || 0);
+
   const agg = {
     wins: stats.wins,
     losses: stats.losses,
@@ -735,7 +752,9 @@ async function collectYesterdayForUser(username) {
     kd: Number.isFinite(stats.kd) ? stats.kd : (stats.d > 0 ? stats.k / stats.d : 0),
     hs_pct: Number.isFinite(stats.hs) ? stats.hs : 0,
     days: 1,
+    matches, wr, kpm, dpm, net,
   };
+
   return { username, url, agg, count: 1 };
 }
 
