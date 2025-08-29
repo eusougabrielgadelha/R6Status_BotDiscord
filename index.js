@@ -806,8 +806,8 @@ function buildRankings(collected) {
   const top = (arr, n = 6) => arr.slice(0, n);
 
   // Regras de corte para evitar outliers
-  const MIN_MATCHES = 3;      // para WR/KPM/Net etc.
-  const MIN_KILLS_FOR_HS = 8; // para HS%
+  const MIN_MATCHES = 1;      // para WR/KPM/Net etc.
+  const MIN_KILLS_FOR_HS = 1; // para HS%
 
   // Conjuntos filtrados
   const withMatches = played.filter(p => safe(p.matches) >= MIN_MATCHES);
