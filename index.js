@@ -4,10 +4,11 @@
 // Agendamentos: diário (relatório), semanal/mensal (rankings) por guild
 // Persistência: SQLite (jogadores e horários)
 // Scraping: Cheerio diretamente do perfil TRN
+// ⚙️ Anti-403: Playwright headless "farmer" para obter cookies reais
 // ------------------------------------------------------------
 
 import dotenv from 'dotenv';
-dotenv.config({ quiet: true }); // silencia logs do dotenv
+dotenv.config({ quiet: true });
 
 import {
   Client,
@@ -30,12 +31,11 @@ import * as cheerio from 'cheerio';
 // -------------------------------
 const {
   DISCORD_TOKEN,
-  GUILD_ID,         // opcional (registro de slash em uma guild)
-  GUILD_IDS,        // opcional (lista separada por vírgula)
+  GUILD_ID,
+  GUILD_IDS,
   PREFIX = '!',
 } = process.env;
 
-// Fuso: aceita TZ (compat Node) ou TIMEZONE (compat anteriores)
 const TZ = process.env.TZ || process.env.TIMEZONE || 'America/Sao_Paulo';
 
 if (!DISCORD_TOKEN) {
@@ -44,7 +44,7 @@ if (!DISCORD_TOKEN) {
 }
 
 // -------------------------------
-/* DB (SQLite) */
+// DB (SQLite)
 // -------------------------------
 const db = new Database('r6bot.db');
 db.pragma('journal_mode = WAL');
@@ -77,116 +77,225 @@ const qDelSchedule    = db.prepare('DELETE FROM schedules WHERE guild_id = ?');
 const qAllSchedules   = db.prepare('SELECT guild_id FROM schedules');
 
 // -------------------------------
+// Util: UA pool
+// -------------------------------
+const UAS = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+];
+const pickUA = () => UAS[Math.floor(Math.random() * UAS.length)];
+
+// -------------------------------
+// Playwright Cookie Farmer (dinâmico)
+// -------------------------------
+const PW_OPTS = {
+  headless: String(process.env.TRN_HEADLESS || 'true').toLowerCase() !== 'false',
+  ttlMin: Number(process.env.TRN_COOKIE_TTL_MIN || 30),
+  cfWaitMs: Number(process.env.TRN_CF_WAIT_MS || 4000),
+  navTimeoutMs: Number(process.env.TRN_NAV_TIMEOUT_MS || 25000),
+};
+
+let _farmerState = {
+  cookie: null,
+  ua: null,
+  fetchedAt: 0, // epoch ms
+};
+
+async function loadPlaywright() {
+  try {
+    // import dinâmico para não travar caso o pacote não esteja instalado
+    const mod = await import('playwright');
+    return mod;
+  } catch (e) {
+    console.warn('⚠️ Playwright não instalado. Defina TRN_COOKIE no .env ou instale: npm i playwright');
+    return null;
+  }
+}
+
+function cookieExpired() {
+  if (!_farmerState.cookie) return true;
+  const ageMin = (Date.now() - _farmerState.fetchedAt) / 60000;
+  return ageMin >= PW_OPTS.ttlMin;
+}
+
+async function refreshCookiesWithPlaywright(sampleProfile = 'gabrielgadelham') {
+  const pw = await loadPlaywright();
+  if (!pw) throw new Error('Playwright indisponível');
+
+  const args = ['--no-sandbox', '--disable-dev-shm-usage'];
+  const ua = pickUA();
+
+  console.log('🧪 Iniciando Playwright (headless:', PW_OPTS.headless, ') para obter cookies…');
+  const browser = await pw.chromium.launch({ headless: PW_OPTS.headless, args });
+  const context = await browser.newContext({ userAgent: ua });
+  const page = await context.newPage();
+
+  try {
+    page.setDefaultTimeout(PW_OPTS.navTimeoutMs);
+
+    // Passo 1: homepage (gera cookies de CF/consent)
+    await page.goto('https://tracker.gg/r6siege', { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(PW_OPTS.cfWaitMs);
+
+    // Passo 2: visitar um perfil real para garantir que a sessão passa no challenge
+    // (usa um nick sample, pode ser qualquer válido)
+    const url = `https://tracker.gg/r6siege/profile/ubisoft/${encodeURIComponent(sampleProfile)}/overview`;
+    await page.goto(url, { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(PW_OPTS.cfWaitMs);
+
+    const cookies = await context.cookies();
+    const jar = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+    if (!jar) throw new Error('Nenhum cookie obtido');
+
+    _farmerState.cookie = jar;
+    _farmerState.ua = ua;
+    _farmerState.fetchedAt = Date.now();
+
+    console.log(`✅ Cookies obtidos (${cookies.length} entradas). UA: ${ua.slice(0, 40)}…`);
+    return { cookie: jar, ua };
+  } finally {
+    await context.close().catch(()=>{});
+    await browser.close().catch(()=>{});
+  }
+}
+
+async function getCookieJar(force = false) {
+  // 1) Se tem TRN_COOKIE no .env, usa ele (manual vence o farmer)
+  const manual = process.env.TRN_COOKIE?.trim();
+  if (manual) return { cookie: manual, ua: pickUA(), source: 'env' };
+
+  // 2) Farmer automático
+  if (force || cookieExpired()) {
+    try {
+      const r = await refreshCookiesWithPlaywright();
+      return { cookie: r.cookie, ua: r.ua, source: 'farmer' };
+    } catch (e) {
+      console.warn('⚠️ Falha ao gerar cookies com Playwright:', e?.message || e);
+      // ainda podemos tentar sem cookie (pode cair em 403, mas tentaremos mesmo assim)
+      return { cookie: '', ua: pickUA(), source: 'none' };
+    }
+  }
+  return { cookie: _farmerState.cookie, ua: _farmerState.ua || pickUA(), source: 'farmer-cache' };
+}
+
+// -------------------------------
 // Scraper TRN (perfil público)
-// 1) Daily blocks por partidas (para HOJE/7/30, semana/mês canônicos)
-// 2) Header do dia específico (para ONTEM de forma robusta)
 // -------------------------------
 const MONTHS_EN = { Jan:1, Feb:2, Mar:3, Apr:4, May:5, Jun:6, Jul:7, Aug:8, Sep:9, Oct:10, Nov:11, Dec:12 };
 
 function toISOFromLabel(label, now = DateTime.now().setZone(TZ)) {
-  // "Aug 28" → "yyyy-MM-dd"
   const m = /^\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\s*$/.exec(label || '');
   if (!m) return null;
   let year = now.year;
   const month = MONTHS_EN[m[1]];
   const day = Number(m[2]);
   let dt = DateTime.fromObject({ year, month, day }, { zone: TZ });
-  // Se estivermos em Jan e o label for Dez, ajusta para ano anterior
   if (now.month === 1 && month === 12) dt = dt.minus({ years: 1 });
   return dt.toISODate();
 }
 
+async function fetchOnce(url, ua, cookie) {
+  const headers = {
+    'User-Agent': ua,
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9,pt-BR;q=0.8,pt;q=0.7',
+    'Upgrade-Insecure-Requests': '1',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1',
+    'Cache-Control': 'no-cache',
+    'Pragma': 'no-cache',
+    'Referer': new URL(url).origin + '/',
+    'Origin': new URL(url).origin,
+  };
+  if (cookie) headers['Cookie'] = cookie;
+
+  const res = await fetch(url, { headers, redirect: 'follow' });
+  const text = await res.text();
+
+  return { status: res.status, ok: res.ok, html: text };
+}
+
+function looksLikeChallenge(html) {
+  return /cf-browser-verification|Attention Required|Just a moment|__cf_chl_captcha_tk__|why_captcha/i.test(html);
+}
+
+/**
+ * fetchProfileHtml(username)
+ * - tenta r6.tracker.network e tracker.gg
+ * - usa TRN_COOKIE (manual) ou cookies do Playwright farmer
+ * - em 403/429/challenge, força refresh dos cookies e re-tenta
+ */
 async function fetchProfileHtml(username) {
-  const cookie = process.env.TRN_COOKIE?.trim();
   const basePref = (process.env.TRN_BASE || 'auto').toLowerCase();
+  const nameEnc = encodeURIComponent(username);
 
   const candidates = [];
-  // r6.tracker.network costuma redirecionar para tracker.gg; tentamos ambos
-  const nameEnc = encodeURIComponent(username);
   const u1 = `https://r6.tracker.network/profile/pc/${nameEnc}`;
   const u2 = `https://tracker.gg/r6siege/profile/ubisoft/${nameEnc}/overview`;
   const u3 = `https://tracker.gg/r6siege/profile/pc/${nameEnc}/overview`;
   if (basePref === 'r6') candidates.push(u1);
   else if (basePref === 'tracker') candidates.push(u2, u3);
-  else candidates.push(u2, u3, u1); // auto: mais estável primeiro
-
-  // pool de User-Agents reais
-  const UAS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  ];
-
-  const delay = (ms) => new Promise(r => setTimeout(r, ms));
+  else candidates.push(u2, u3, u1);
 
   let lastErr;
-  for (const url of candidates) {
-    for (let attempt = 1; attempt <= 4; attempt++) {
-      const ua = UAS[(attempt - 1) % UAS.length];
-      const headers = {
-        'User-Agent': ua,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9,pt-BR;q=0.8,pt;q=0.7',
-        'Upgrade-Insecure-Requests': '1',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Sec-Fetch-User': '?1',
-        'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache',
-      };
-      if (cookie) headers['Cookie'] = cookie;
-      // alguns bloqueios relaxam com referer/origin
-      const origin = new URL(url).origin;
-      headers['Referer'] = origin + '/';
-      headers['Origin'] = origin;
 
-      try {
-        const res = await fetch(url, { headers, redirect: 'follow' });
-        if (res.status === 403 || res.status === 429 || res.status === 503) {
-          lastErr = new Error(`HTTP ${res.status}`);
-          // espera progressiva antes do retry
-          await delay(600 * attempt + Math.floor(Math.random() * 400));
-          continue;
+  // 1ª rodada: com cookies atuais (env ou farmer-cache/farmer)
+  let jar = await getCookieJar(false);
+
+  for (const round of [1, 2]) { // até duas rodadas (2ª força refresh de cookies)
+    for (const url of candidates) {
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        const ua = jar.ua || pickUA();
+        try {
+          const r = await fetchOnce(url, ua, jar.cookie);
+          if (r.status === 403 || r.status === 429 || r.status === 503 || looksLikeChallenge(r.html)) {
+            lastErr = new Error(`HTTP ${r.status} / challenge`);
+            // tenta novamente dentro da mesma rodada com um pequeno backoff
+            await new Promise(res => setTimeout(res, 600 * attempt + Math.floor(Math.random() * 300)));
+            continue;
+          }
+          if (!r.ok) {
+            lastErr = new Error(`HTTP ${r.status}`);
+            break; // troca de domínio
+          }
+          return { url, html: r.html };
+        } catch (e) {
+          lastErr = e;
+          await new Promise(res => setTimeout(res, 500 * attempt));
         }
-        if (!res.ok) {
-          lastErr = new Error(`HTTP ${res.status}`);
-          break; // tenta próximo domínio
-        }
-        const html = await res.text();
-        // checa se caiu numa página de challenge
-        if (/cf-browser-verification|Attention Required|Just a moment/i.test(html)) {
-          lastErr = new Error('Cloudflare challenge');
-          await delay(700 * attempt);
-          continue;
-        }
-        return { url, html };
-      } catch (e) {
-        lastErr = e;
-        await delay(500 * attempt);
       }
     }
-    // próxima opção de domínio
+
+    // Se chegamos aqui, a rodada falhou. Força refresh dos cookies (apenas se não for cookie manual)
+    if (process.env.TRN_COOKIE?.trim()) break; // com cookie manual não adianta forçar
+    console.log('🔁 Forçando refresh de cookies via Playwright e tentando novamente…');
+    try {
+      jar = await getCookieJar(true);
+    } catch (e) {
+      lastErr = e;
+      break;
+    }
   }
 
-  const hint = cookie
-    ? 'Verifique se TRN_COOKIE ainda é válido (pode expirar).'
-    : 'Defina TRN_COOKIE no .env (copie o header Cookie do seu navegador no tracker.gg) para evitar 403.';
+  const hint = process.env.TRN_COOKIE?.trim()
+    ? 'Verifique se TRN_COOKIE ainda é válido (pode expirar/invalidar).'
+    : 'Instale o Playwright e deixe o bot gerar cookies automaticamente (npm i playwright).';
+
   throw new Error(`Falha ao carregar perfil ${username}: ${lastErr?.message || 'bloqueado'} — ${hint}`);
 }
-
 
 /**
  * scrapeDailyBlocks(username)
  * → { url, blocks: [ { dateLabel, iso, wins, losses, k, d, hs_pct } ] }
- *  - hs_pct em 0–100 (média simples das partidas do dia)
  */
 async function scrapeDailyBlocks(username) {
   const { url, html } = await fetchProfileHtml(username);
   const $ = cheerio.load(html);
 
   const blocks = [];
-  // Cada "dia" fica em seção com header "Aug 28", etc. (layout TRN v3)
   $('div.col-span-full.grid.grid-cols-subgrid.gap-5').each((_, section) => {
     const header = $(section).find('header .text-18.font-bold.text-secondary').first().text().trim();
     const iso = toISOFromLabel(header);
@@ -207,7 +316,6 @@ async function scrapeDailyBlocks(username) {
         k = parseInt($(kdList[0]).text().trim(), 10) || 0;
         d = parseInt($(kdList[1]).text().trim(), 10) || 0;
       } else {
-        // fallback leve
         const kdTxt = $row.find('.stat-name:contains("K/D")').parent().find('.stat-value').first().text().trim();
         const kd = parseFloat(kdTxt.replace(',', '.')) || 0;
         d = kd > 0 ? 1 : 0;
@@ -227,10 +335,7 @@ async function scrapeDailyBlocks(username) {
         .replace('%', '')
         .replace(',', '.');
       const hs = parseFloat(hsTxt);
-      if (!Number.isNaN(hs)) {
-        hsAcc += hs;
-        hsN += 1;
-      }
+      if (!Number.isNaN(hs)) { hsAcc += hs; hsN += 1; }
     });
 
     const hs_pct = hsN > 0 ? (hsAcc / hsN) : 0;
@@ -240,26 +345,21 @@ async function scrapeDailyBlocks(username) {
   return { url, blocks };
 }
 
-// ---------- (Novos utilitários para o cabeçalho do dia) ----------
+// ---------- Helpers para o HEADER do dia ----------
 function yesterdayLabel(now = DateTime.now().setZone(TZ)) {
   return now.minus({ days: 1 }).setLocale('en-US').toFormat('MMM d'); // "Aug 28"
 }
 
-// Seleciona o <header> cujo label de data bate
 function findHeaderForLabel($, label) {
   let target = null;
   $('header').each((_, el) => {
     const txt =
       $(el).find('div[class*="text-18"][class*="font-bold"][class*="text-secondary"]').first().text().trim();
-    if (txt.toLowerCase() === String(label).toLowerCase()) {
-      target = $(el);
-      return false; // break
-    }
+    if (txt.toLowerCase() === String(label).toLowerCase()) { target = $(el); return false; }
   });
   return target;
 }
 
-// Lê números do bloco "name-value" pelo rótulo (K/D | K | D | HS%)
 function readHeaderNumber($, header, key) {
   const name = header
     .find('.stat-hor .name-value .stat-name .truncate')
@@ -273,16 +373,11 @@ function readHeaderNumber($, header, key) {
   return Number(clean);
 }
 
-/**
- * extractDayStatsFromHtml(html, label)
- * Retorna { wins, losses, k, d, kd, hs } do HEADER daquele dia
- */
 function extractDayStatsFromHtml(html, label) {
   const $ = cheerio.load(html);
   const header = findHeaderForLabel($, label);
   if (!header || !header.length) return null;
 
-  // W / L
   let wins = 0, losses = 0;
   header.find('.stat-list .value').each((_, el) => {
     const txt = $(el).text().trim();
@@ -291,7 +386,6 @@ function extractDayStatsFromHtml(html, label) {
     if (/L/i.test(txt)) losses = n;
   });
 
-  // K / D / K-D / HS%
   const kd = readHeaderNumber($, header, 'K/D');
   const k  = readHeaderNumber($, header, 'K');
   const d  = readHeaderNumber($, header, 'D');
@@ -301,7 +395,7 @@ function extractDayStatsFromHtml(html, label) {
 }
 
 // -------------------------------
-// Util: janelas canônicas e relativas
+// Janelas
 // -------------------------------
 function filterBlocksByWindow(blocks, start, end) {
   return blocks
@@ -312,53 +406,43 @@ function filterBlocksByWindow(blocks, start, end) {
     });
 }
 
-// Para comandos interativos (não agendados): janelas relativas ao hoje
 function filterBlocksByRange(blocks, range, now = DateTime.now().setZone(TZ)) {
   const today = now.startOf('day');
   let start;
-  if (range === 'day') start = today;                    // hoje
-  else if (range === 'week') start = today.minus({ days: 6 });  // últimos 7
-  else if (range === 'month') start = today.minus({ days: 29 }); // últimos 30
+  if (range === 'day') start = today;
+  else if (range === 'week') start = today.minus({ days: 6 });
+  else if (range === 'month') start = today.minus({ days: 29 });
   else start = today;
   const end = today.endOf('day');
   return filterBlocksByWindow(blocks, start, end);
 }
 
-// Para agendamentos (janelas canônicas: semana/mês anteriores)
 function getCanonicalWindow(kind, now = DateTime.now().setZone(TZ)) {
   if (kind === 'day') {
     const start = now.startOf('day');
     return { start, end: start.endOf('day') };
   }
   if (kind === 'week') {
-    // semana anterior completa (seg→dom) — ISO week
     const prev = now.minus({ weeks: 1 });
-    const start = prev.startOf('week');
-    const end   = prev.endOf('week');
-    return { start, end };
+    return { start: prev.startOf('week'), end: prev.endOf('week') };
   }
   if (kind === 'month') {
-    // mês anterior completo
     const prev = now.minus({ months: 1 });
-    const start = prev.startOf('month');
-    const end   = prev.endOf('month');
-    return { start, end };
+    return { start: prev.startOf('month'), end: prev.endOf('month') };
   }
   const start = now.startOf('day');
   return { start, end: start.endOf('day') };
 }
 
-// Janela de ONTEM (um único dia civil no fuso TZ) — ainda usada em ajuda/crons
 function getYesterdayWindow(now = DateTime.now().setZone(TZ)) {
   const y = now.minus({ days: 1 }).startOf('day');
   return { start: y, end: y.endOf('day') };
 }
 
 // -------------------------------
-// Agregação por jogador (para blocks)
+// Agregação
 // -------------------------------
 function aggregate(blocks) {
-  // Soma total de K, D, W, L; KD = K_total/D_total; HS% ponderado por kills
   let totalK = 0, totalD = 0, totalWins = 0, totalLosses = 0;
   let hsShotsEst = 0;
 
@@ -368,7 +452,6 @@ function aggregate(blocks) {
     if (Number.isFinite(b.wins)) totalWins += b.wins;
     if (Number.isFinite(b.losses)) totalLosses += b.losses;
     if (Number.isFinite(b.hs_pct) && Number.isFinite(b.k)) {
-      // aproximação: HS% * kills do bloco
       hsShotsEst += (b.hs_pct / 100) * b.k;
     }
   }
@@ -380,8 +463,6 @@ function aggregate(blocks) {
   return { wins: totalWins, losses: totalLosses, k: totalK, d: totalD, kd, hs_pct: hsPct, days: blocks.length };
 }
 
-// -------------------------------
-// Embeds
 // -------------------------------
 function embedReport(rangeTitle, username, url, agg) {
   return new EmbedBuilder()
@@ -403,10 +484,10 @@ function embedRanking(rangeTitle, rankings) {
 
   const desc = [
     fmt('Quem mais matou', rankings.mostKills,  (r)=> `**${r.username}** — ${r.k}`),
-    fmt('Quem mais morreu', rankings.mostDeaths, (r)=> `**${r.username}** — ${r.d}`),
-    fmt('Melhor K/D',      rankings.bestKD,     (r)=> `**${r.username}** — ${r.kd.toFixed(2)}`),
-    fmt('Melhor HS%',      rankings.bestHS,     (r)=> `**${r.username}** — ${r.hs_pct.toFixed(1)}%`),
-    fmt('Quem mais venceu',rankings.mostWins,   (r)=> `**${r.username}** — ${r.wins}`),
+    fmt('Quem mais morreu', rankings.mostDeaths,(r)=> `**${r.username}** — ${r.d}`),
+    fmt('Melhor K/D',       rankings.bestKD,    (r)=> `**${r.username}** — ${r.kd.toFixed(2)}`),
+    fmt('Melhor HS%',       rankings.bestHS,    (r)=> `**${r.username}** — ${r.hs_pct.toFixed(1)}%`),
+    fmt('Quem mais venceu', rankings.mostWins,  (r)=> `**${r.username}** — ${r.wins}`),
   ].join('\n\n');
 
   return new EmbedBuilder()
@@ -460,7 +541,7 @@ async function collectForGuildWindow(guildId, start, end) {
   return results;
 }
 
-// ---------- (Novo) Coleta baseada no HEADER de ontem ----------
+// ---------- Coleta baseada no HEADER de ontem ----------
 async function collectYesterdayForUser(username) {
   const { url, html } = await fetchProfileHtml(username);
   const label = yesterdayLabel();
@@ -539,12 +620,11 @@ async function installCronsForGuild(client, guildId) {
   const parsed = parseHHmm(time_str);
   if (!parsed) return;
 
-  // stop anteriores
   stopCronsForGuild(guildId);
 
-  const dailyExpr   = `${parsed.mm} ${parsed.hh} * * *`;    // todo dia
-  const weeklyExpr  = `${parsed.mm} ${parsed.hh} * * 1`;    // segunda-feira
-  const monthlyExpr = `${parsed.mm} ${parsed.hh} 1 * *`;    // dia 1
+  const dailyExpr   = `${parsed.mm} ${parsed.hh} * * *`;
+  const weeklyExpr  = `${parsed.mm} ${parsed.hh} * * 1`;
+  const monthlyExpr = `${parsed.mm} ${parsed.hh} 1 * *`;
 
   const daily = cron.schedule(dailyExpr, async () => {
     try {
@@ -571,15 +651,15 @@ async function installCronsForGuild(client, guildId) {
       const ch = await client.channels.fetch(channel_id);
       if (!ch?.isTextBased()) return;
 
-    const now = DateTime.now().setZone(TZ);
-    const { start, end } = getCanonicalWindow('week', now);
-    const results = await collectForGuildWindow(guildId, start, end);
-    if (!results.length) {
-      await ch.send('Nenhum jogador cadastrado. Use `/cadastrar nick`.');
-      return;
-    }
-    const rk = buildRankings(results);
-    await ch.send({ embeds: [embedRanking(`— Semana Anterior (${start.toFormat('dd/LL')}–${end.toFormat('dd/LL')})`, rk)] });
+      const now = DateTime.now().setZone(TZ);
+      const { start, end } = getCanonicalWindow('week', now);
+      const results = await collectForGuildWindow(guildId, start, end);
+      if (!results.length) {
+        await ch.send('Nenhum jogador cadastrado. Use `/cadastrar nick`.');
+        return;
+      }
+      const rk = buildRankings(results);
+      await ch.send({ embeds: [embedRanking(`— Semana Anterior (${start.toFormat('dd/LL')}–${end.toFormat('dd/LL')})`, rk)] });
     } catch (e) {
       console.error('Falha no cron semanal:', e);
     }
@@ -614,18 +694,17 @@ async function installAllCrons(client) {
 }
 
 // -------------------------------
-/* Discord client + slash */
+// Discord client + slash
 // -------------------------------
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,   // prefixo
-    GatewayIntentBits.MessageContent,  // conteúdo (ative no portal!)
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
   ],
   partials: [Partials.Channel],
 });
 
-// Slash commands
 const slashCommands = [
   new SlashCommandBuilder()
     .setName('cadastrar')
@@ -672,7 +751,6 @@ const slashCommands = [
 
 async function registerSlashCommands() {
   const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
-  // aguarda client ready para ter application id
   const app = await client.application?.fetch();
   const appId = app?.id || client.user.id;
 
@@ -719,7 +797,6 @@ client.on('interactionCreate', async (ix) => {
   const name = ix.commandName;
   const guildId = ix.guildId;
 
-  // /cadastrar (admin)
   if (name === 'cadastrar') {
     if (!ix.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
       await confirm(ix, '❌ Apenas admins (Manage Server) podem cadastrar jogadores.', { ephemeral: true });
@@ -736,7 +813,6 @@ client.on('interactionCreate', async (ix) => {
     return;
   }
 
-  // /programar (admin) -> instala 3 crons
   if (name === 'programar') {
     if (!ix.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
       await confirm(ix, '❌ Apenas admins (Manage Server) podem programar.', { ephemeral: true });
@@ -756,7 +832,6 @@ client.on('interactionCreate', async (ix) => {
     return;
   }
 
-  // /cancelar_programacao (admin)
   if (name === 'cancelar_programacao') {
     if (!ix.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
       await confirm(ix, '❌ Apenas admins (Manage Server) podem cancelar programação.', { ephemeral: true });
@@ -768,7 +843,6 @@ client.on('interactionCreate', async (ix) => {
     return;
   }
 
-  // /yesterday_ranking — agora baseado no HEADER "MMM d"
   if (name === 'yesterday_ranking') {
     await ix.deferReply();
     const label = yesterdayLabel();
@@ -792,7 +866,6 @@ client.on('interactionCreate', async (ix) => {
     return;
   }
 
-  // Demais comandos de relatório/ranking (hoje/7/30)
   const rangeMap = {
     daily_report:   'day',
     weekly_report:  'week',
@@ -804,7 +877,7 @@ client.on('interactionCreate', async (ix) => {
 
   if (name in rangeMap) {
     const range = rangeMap[name];
-    await ix.deferReply(); // público
+    await ix.deferReply();
 
     const label = range === 'day' ? 'de hoje' :
                   range === 'week' ? 'dos últimos 7 dias' :
@@ -812,7 +885,6 @@ client.on('interactionCreate', async (ix) => {
 
     const isReport = name.endsWith('report');
 
-    // single (opcional) nos reports
     const nickOpt = isReport ? ix.options.getString('nick') : null;
     if (isReport && nickOpt) {
       const nick = nickOpt.trim();
@@ -829,7 +901,6 @@ client.on('interactionCreate', async (ix) => {
       return;
     }
 
-    // Todos os cadastrados
     await confirm(ix, `🔎 Recebi **/${name}** — gerando ${isReport ? 'relatório' : 'ranking'} ${label}…`);
     try {
       const results = await collectForGuild(guildId, range);
@@ -863,7 +934,7 @@ client.on('interactionCreate', async (ix) => {
 });
 
 // -------------------------------
-// Handler: PREFIXO (inclui !cadastrar e !yesterday_ranking)
+// Handler: PREFIXO
 // -------------------------------
 client.on('messageCreate', async (msg) => {
   if (!msg.guild || msg.author.bot) return;
@@ -876,7 +947,6 @@ client.on('messageCreate', async (msg) => {
   const isAdmin = msg.member?.permissions?.has(PermissionFlagsBits.ManageGuild);
   const send = (m) => msg.channel.send(m);
 
-  // Admin: cadastrar
   if (cmd === 'cadastrar') {
     if (!isAdmin) return send('❌ Apenas admins (Manage Server) podem usar `!cadastrar`.');
     const nick = args.join(' ').trim();
@@ -886,7 +956,6 @@ client.on('messageCreate', async (msg) => {
     return send(`✅ **${nick}** cadastrado. Jogadores agora: **${total}**.`);
   }
 
-  // Admin: remover jogador (opcional)
   if (cmd === 'remover') {
     if (!isAdmin) return send('❌ Apenas admins (Manage Server) podem usar `!remover`.');
     const nick = args.join(' ').trim();
@@ -896,12 +965,10 @@ client.on('messageCreate', async (msg) => {
     return send(`⚠️ **${nick}** não estava cadastrado.`);
   }
 
-  // Admin: programar (#canal HH:mm) — instala 3 crons
   if (cmd === 'programar') {
     if (!isAdmin) return send('❌ Apenas admins (Manage Server) podem usar `!programar`.');
     if (args.length < 2) return send('Uso: `!programar #canal HH:mm`');
 
-    // canal: menção, id ou nome
     const chMention = msg.mentions.channels.first();
     let target = chMention;
     if (!target) {
@@ -926,7 +993,6 @@ client.on('messageCreate', async (msg) => {
     return send(`✅ Programado!\n• Canal: ${target}\n• Horário base: **${horario} ${TZ}**\n• Envia: diário (relatório), **segunda** (ranking semanal da semana anterior) e **1º dia** (ranking mensal do mês anterior).`);
   }
 
-  // Admin: cancelar-programação
   if (cmd === 'cancelar-programação' || cmd === 'cancelar_programacao' || cmd === 'cancelarprogramacao') {
     if (!isAdmin) return send('❌ Apenas admins (Manage Server) podem usar `!cancelar-programação`.');
     stopCronsForGuild(msg.guild.id);
@@ -934,7 +1000,6 @@ client.on('messageCreate', async (msg) => {
     return send('🛑 Programações **canceladas** para este servidor.');
   }
 
-  // !yesterday_ranking — agora baseado no HEADER "MMM d"
   if (cmd === 'yesterday_ranking') {
     const label = yesterdayLabel();
     await send('🔎 Gerando ranking **de ontem**…');
@@ -952,7 +1017,6 @@ client.on('messageCreate', async (msg) => {
     }
   }
 
-  // Map de intervalos (hoje/7/30)
   const rangeMap = {
     'daily_report':   'day',
     'weekly_report':  'week',
@@ -969,7 +1033,6 @@ client.on('messageCreate', async (msg) => {
                : range === 'week' ? 'dos últimos 7 dias'
                : 'dos últimos 30 dias';
 
-    // single (opcional) nos reports: !daily_report <nick>
     const singleNick = isReport && args.length ? args.join(' ').trim() : null;
 
     if (singleNick) {
@@ -986,7 +1049,6 @@ client.on('messageCreate', async (msg) => {
       return;
     }
 
-    // todos os cadastrados
     await send(`🔎 Recebi **${PREFIX}${cmd}** — gerando ${isReport ? 'relatório' : 'ranking'} ${label}…`);
     try {
       const results = await collectForGuild(msg.guild.id, range);
@@ -1016,7 +1078,6 @@ client.on('messageCreate', async (msg) => {
     return;
   }
 
-  // Ajuda detalhada (prefixo)
   if (cmd === 'help' || cmd === 'ajuda') {
     const eb = new EmbedBuilder()
       .setTitle('R6 — Ajuda (comandos por prefixo)')
@@ -1077,7 +1138,7 @@ client.on('messageCreate', async (msg) => {
         {
           name: 'Dicas',
           value: [
-            `• O site pode demorar 10–15s para renderizar (o bot já espera).`,
+            `• O site pode demorar 10–15s para renderizar.`,
             `• KD = **K_total/D_total**; HS% ponderado por **kills**.`,
             `• Para muitas pessoas, o bot manda vários embeds em sequência.`,
           ].join('\n'),
