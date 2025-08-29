@@ -78,7 +78,8 @@ const qAllSchedules   = db.prepare('SELECT guild_id FROM schedules');
 
 // -------------------------------
 // Scraper TRN (perfil público)
-// Retorna blocos diários agregados (wins, losses, k, d, hs_pct)
+// 1) Daily blocks por partidas (para HOJE/7/30, semana/mês canônicos)
+// 2) Header do dia específico (para ONTEM de forma robusta)
 // -------------------------------
 const MONTHS_EN = { Jan:1, Feb:2, Mar:3, Apr:4, May:5, Jun:6, Jul:7, Aug:8, Sep:9, Oct:10, Nov:11, Dec:12 };
 
@@ -172,6 +173,66 @@ async function scrapeDailyBlocks(username) {
   return { url, blocks };
 }
 
+// ---------- (Novos utilitários para o cabeçalho do dia) ----------
+function yesterdayLabel(now = DateTime.now().setZone(TZ)) {
+  return now.minus({ days: 1 }).setLocale('en-US').toFormat('MMM d'); // "Aug 28"
+}
+
+// Seleciona o <header> cujo label de data bate
+function findHeaderForLabel($, label) {
+  let target = null;
+  $('header').each((_, el) => {
+    const txt =
+      $(el).find('div[class*="text-18"][class*="font-bold"][class*="text-secondary"]').first().text().trim();
+    if (txt.toLowerCase() === String(label).toLowerCase()) {
+      target = $(el);
+      return false; // break
+    }
+  });
+  return target;
+}
+
+// Lê números do bloco "name-value" pelo rótulo (K/D | K | D | HS%)
+function readHeaderNumber($, header, key) {
+  const name = header
+    .find('.stat-hor .name-value .stat-name .truncate')
+    .filter((_, el) => $(el).text().trim() === key)
+    .first()
+    .closest('.name-value');
+
+  if (!name.length) return NaN;
+  const raw = name.find('.stat-value .truncate').first().text().trim();
+  const clean = raw.replace('%', '').trim().replace(',', '.');
+  return Number(clean);
+}
+
+/**
+ * extractDayStatsFromHtml(html, label)
+ * Retorna { wins, losses, k, d, kd, hs } do HEADER daquele dia
+ */
+function extractDayStatsFromHtml(html, label) {
+  const $ = cheerio.load(html);
+  const header = findHeaderForLabel($, label);
+  if (!header || !header.length) return null;
+
+  // W / L
+  let wins = 0, losses = 0;
+  header.find('.stat-list .value').each((_, el) => {
+    const txt = $(el).text().trim();
+    const n = parseInt(txt.replace(/\D+/g, ''), 10) || 0;
+    if (/W/i.test(txt)) wins = n;
+    if (/L/i.test(txt)) losses = n;
+  });
+
+  // K / D / K-D / HS%
+  const kd = readHeaderNumber($, header, 'K/D');
+  const k  = readHeaderNumber($, header, 'K');
+  const d  = readHeaderNumber($, header, 'D');
+  const hs = readHeaderNumber($, header, 'HS%');
+
+  return { wins, losses, k, d, kd, hs };
+}
+
 // -------------------------------
 // Util: janelas canônicas e relativas
 // -------------------------------
@@ -220,14 +281,14 @@ function getCanonicalWindow(kind, now = DateTime.now().setZone(TZ)) {
   return { start, end: start.endOf('day') };
 }
 
-// Janela de ONTEM (um único dia civil no fuso TZ)
+// Janela de ONTEM (um único dia civil no fuso TZ) — ainda usada em ajuda/crons
 function getYesterdayWindow(now = DateTime.now().setZone(TZ)) {
   const y = now.minus({ days: 1 }).startOf('day');
   return { start: y, end: y.endOf('day') };
 }
 
 // -------------------------------
-// Agregação por jogador
+// Agregação por jogador (para blocks)
 // -------------------------------
 function aggregate(blocks) {
   // Soma total de K, D, W, L; KD = K_total/D_total; HS% ponderado por kills
@@ -332,6 +393,39 @@ async function collectForGuildWindow(guildId, start, end) {
   return results;
 }
 
+// ---------- (Novo) Coleta baseada no HEADER de ontem ----------
+async function collectYesterdayForUser(username) {
+  const { url, html } = await fetchProfileHtml(username);
+  const label = yesterdayLabel();
+  const stats = extractDayStatsFromHtml(html, label);
+  if (!stats) throw new Error(`Sem bloco de "${label}"`);
+  const agg = {
+    wins: stats.wins,
+    losses: stats.losses,
+    k: stats.k,
+    d: stats.d,
+    kd: Number.isFinite(stats.kd) ? stats.kd : (stats.d > 0 ? stats.k / stats.d : 0),
+    hs_pct: Number.isFinite(stats.hs) ? stats.hs : 0,
+    days: 1,
+  };
+  return { username, url, agg, count: 1 };
+}
+
+async function collectYesterdayForGuild(guildId) {
+  const rows = qListPlayers.all(guildId);
+  const results = [];
+  const label = yesterdayLabel();
+  for (const r of rows) {
+    try {
+      const one = await collectYesterdayForUser(r.username);
+      results.push(one);
+    } catch (e) {
+      results.push({ username: r.username, error: true, err: `Sem dados para ${label}` });
+    }
+  }
+  return results;
+}
+
 // -------------------------------
 // Rankings (ordenações)
 // -------------------------------
@@ -410,15 +504,15 @@ async function installCronsForGuild(client, guildId) {
       const ch = await client.channels.fetch(channel_id);
       if (!ch?.isTextBased()) return;
 
-      const now = DateTime.now().setZone(TZ);
-      const { start, end } = getCanonicalWindow('week', now);
-      const results = await collectForGuildWindow(guildId, start, end);
-      if (!results.length) {
-        await ch.send('Nenhum jogador cadastrado. Use `/cadastrar nick`.');
-        return;
-      }
-      const rk = buildRankings(results);
-      await ch.send({ embeds: [embedRanking(`— Semana Anterior (${start.toFormat('dd/LL')}–${end.toFormat('dd/LL')})`, rk)] });
+    const now = DateTime.now().setZone(TZ);
+    const { start, end } = getCanonicalWindow('week', now);
+    const results = await collectForGuildWindow(guildId, start, end);
+    if (!results.length) {
+      await ch.send('Nenhum jogador cadastrado. Use `/cadastrar nick`.');
+      return;
+    }
+    const rk = buildRankings(results);
+    await ch.send({ embeds: [embedRanking(`— Semana Anterior (${start.toFormat('dd/LL')}–${end.toFormat('dd/LL')})`, rk)] });
     } catch (e) {
       console.error('Falha no cron semanal:', e);
     }
@@ -607,14 +701,19 @@ client.on('interactionCreate', async (ix) => {
     return;
   }
 
-  // /yesterday_ranking — dia anterior (janela de 1 dia)
+  // /yesterday_ranking — agora baseado no HEADER "MMM d"
   if (name === 'yesterday_ranking') {
     await ix.deferReply();
-    const { start, end } = getYesterdayWindow();
+    const label = yesterdayLabel();
     try {
-      const results = await collectForGuildWindow(guildId, start, end);
+      const results = await collectYesterdayForGuild(guildId);
       if (!results.length) {
         await confirm(ix, '⚠️ Nenhum jogador cadastrado. Use `/cadastrar nick` primeiro.', { edit: true });
+        return;
+      }
+      const ok = results.filter(r => !r.error);
+      if (!ok.length) {
+        await confirm(ix, `⚠️ Ninguém jogou **${label}**.`, { edit: true });
         return;
       }
       const rk = buildRankings(results);
@@ -768,13 +867,15 @@ client.on('messageCreate', async (msg) => {
     return send('🛑 Programações **canceladas** para este servidor.');
   }
 
-  // !yesterday_ranking — dia anterior
+  // !yesterday_ranking — agora baseado no HEADER "MMM d"
   if (cmd === 'yesterday_ranking') {
-    const { start, end } = getYesterdayWindow();
+    const label = yesterdayLabel();
     await send('🔎 Gerando ranking **de ontem**…');
     try {
-      const results = await collectForGuildWindow(msg.guild.id, start, end);
+      const results = await collectYesterdayForGuild(msg.guild.id);
       if (!results.length) return send('⚠️ Nenhum jogador cadastrado. Use `/cadastrar nick` ou `!cadastrar <nick>`.');
+      const ok = results.filter(r => !r.error);
+      if (!ok.length) return send(`⚠️ Ninguém jogou **${label}**.`);
       const rk = buildRankings(results);
       await send({ embeds: [embedRanking('— Ontem', rk)] });
       return;
