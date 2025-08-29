@@ -43,8 +43,8 @@ const {
   TRN_SAMPLE_PROFILE,         // opcional, perfil usado para "farmar" cookie
   TRN_HEADLESS = 'true',      // "true" recomendado em servidor
   TRN_COOKIE_TTL_MIN = '30',  // minutos para refarmar cookies
-  TRN_CF_WAIT_MS = '4000',    // espera adicional para passar Cloudflare
-  TRN_NAV_TIMEOUT_MS = '25000', // timeout de navegação (ms)
+  TRN_CF_WAIT_MS = '12000',    // espera adicional para passar Cloudflare
+  TRN_NAV_TIMEOUT_MS = '45000', // timeout de navegação (ms)
 
   // Opcional: apontar Chrome do sistema
   CHROME_EXE,                 // ex.: /snap/bin/chromium
