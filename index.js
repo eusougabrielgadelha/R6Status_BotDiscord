@@ -229,61 +229,99 @@ function looksLikeChallenge(html) {
  * - em 403/429/challenge, força refresh dos cookies e re-tenta
  */
 async function fetchProfileHtml(username) {
+  const cookie   = process.env.TRN_COOKIE?.trim();
   const basePref = (process.env.TRN_BASE || 'auto').toLowerCase();
+
+  // plataforma base (pc|xbox|psn). aceitamos alguns aliases
+  const PLATFORM_ALIASES = {
+    ubisoft: 'pc', ubi: 'pc', uplay: 'pc',
+    pc: 'pc',
+    xbox: 'xbox', xbl: 'xbox',
+    ps: 'psn', psn: 'psn', playstation: 'psn'
+  };
+  const platIn = (process.env.TRN_PLATFORM || 'pc').toLowerCase();
+  const plat = PLATFORM_ALIASES[platIn] || 'pc';
+
   const nameEnc = encodeURIComponent(username);
 
-  const candidates = [];
-  const u1 = `https://r6.tracker.network/profile/pc/${nameEnc}`;
-  const u2 = `https://tracker.gg/r6siege/profile/ubisoft/${nameEnc}/overview`;
-  const u3 = `https://tracker.gg/r6siege/profile/pc/${nameEnc}/overview`;
-  if (basePref === 'r6') candidates.push(u1);
-  else if (basePref === 'tracker') candidates.push(u2, u3);
-  else candidates.push(u2, u3, u1);
+  // ==== NOVOS CANDIDATES ====
+  // tracker.gg — caminho "ubisoft" (funciona para vários perfis)
+  const uTrkUbiOverview = `https://tracker.gg/r6siege/profile/ubisoft/${nameEnc}/overview`;
+  // tracker.gg — caminho por plataforma normal
+  const uTrkPlatOverview = `https://tracker.gg/r6siege/profile/${plat}/${nameEnc}/overview`;
+  // r6.tracker.network — caminho “ubi” (matches)
+  const uR6UbiMatches = `https://r6.tracker.network/r6siege/profile/ubi/${nameEnc}/matches`;
+  // r6.tracker.network — caminho por plataforma normal
+  const uR6PlatProfile = `https://r6.tracker.network/profile/${plat}/${nameEnc}`;
+
+  let candidates;
+  if (basePref === 'tracker') {
+    candidates = [uTrkUbiOverview, uTrkPlatOverview, uR6UbiMatches, uR6PlatProfile];
+  } else if (basePref === 'r6') {
+    candidates = [uR6PlatProfile, uR6UbiMatches, uTrkPlatOverview, uTrkUbiOverview];
+  } else {
+    // auto (recomendado)
+    candidates = [uTrkUbiOverview, uTrkPlatOverview, uR6UbiMatches, uR6PlatProfile];
+  }
+  // remove duplicatas
+  candidates = [...new Set(candidates)];
+
+  // pool de User-Agents reais
+  const UAS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  ];
+  const delay = (ms) => new Promise(r => setTimeout(r, ms));
 
   let lastErr;
+  for (const url of candidates) {
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      const ua = UAS[(attempt - 1) % UAS.length];
+      const headers = {
+        'User-Agent': ua,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9,pt-BR;q=0.8,pt;q=0.7',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+        'Referer': new URL(url).origin + '/',
+        'Origin':  new URL(url).origin,
+      };
+      if (cookie) headers['Cookie'] = cookie;
 
-  // 1ª rodada: com cookies atuais (env ou farmer-cache/farmer)
-  let jar = await getCookieJar(false);
-
-  for (const round of [1, 2]) { // até duas rodadas (2ª força refresh de cookies)
-    for (const url of candidates) {
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        const ua = jar.ua || pickUA();
-        try {
-          const r = await fetchOnce(url, ua, jar.cookie);
-          if (r.status === 403 || r.status === 429 || r.status === 503 || looksLikeChallenge(r.html)) {
-            lastErr = new Error(`HTTP ${r.status} / challenge`);
-            // tenta novamente dentro da mesma rodada com um pequeno backoff
-            await new Promise(res => setTimeout(res, 600 * attempt + Math.floor(Math.random() * 300)));
-            continue;
-          }
-          if (!r.ok) {
-            lastErr = new Error(`HTTP ${r.status}`);
-            break; // troca de domínio
-          }
-          return { url, html: r.html };
-        } catch (e) {
-          lastErr = e;
-          await new Promise(res => setTimeout(res, 500 * attempt));
+      try {
+        const res = await fetch(url, { headers, redirect: 'follow' });
+        if (res.status === 403 || res.status === 429 || res.status === 503) {
+          lastErr = new Error(`HTTP ${res.status}`);
+          await delay(600 * attempt + Math.floor(Math.random() * 400));
+          continue;
         }
+        if (!res.ok) {
+          lastErr = new Error(`HTTP ${res.status}`);
+          break; // tenta o próximo candidate
+        }
+        const html = await res.text();
+        if (/cf-browser-verification|Attention Required|Just a moment/i.test(html)) {
+          lastErr = new Error('Cloudflare challenge');
+          await delay(700 * attempt);
+          continue;
+        }
+        return { url, html };
+      } catch (e) {
+        lastErr = e;
+        await delay(500 * attempt);
       }
-    }
-
-    // Se chegamos aqui, a rodada falhou. Força refresh dos cookies (apenas se não for cookie manual)
-    if (process.env.TRN_COOKIE?.trim()) break; // com cookie manual não adianta forçar
-    console.log('🔁 Forçando refresh de cookies via Playwright e tentando novamente…');
-    try {
-      jar = await getCookieJar(true);
-    } catch (e) {
-      lastErr = e;
-      break;
     }
   }
 
-  const hint = process.env.TRN_COOKIE?.trim()
-    ? 'Verifique se TRN_COOKIE ainda é válido (pode expirar/invalidar).'
-    : 'Instale o Playwright e deixe o bot gerar cookies automaticamente (npm i playwright).';
-
+  const hint = cookie
+    ? 'Verifique se TRN_COOKIE ainda é válido (pode expirar).'
+    : 'Configure TRN_COOKIE ou ative o Playwright para farmar cookies.';
   throw new Error(`Falha ao carregar perfil ${username}: ${lastErr?.message || 'bloqueado'} — ${hint}`);
 }
 
