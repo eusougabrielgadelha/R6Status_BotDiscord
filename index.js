@@ -41,8 +41,8 @@ const {
   TRN_SAMPLE_PROFILE,
   TRN_HEADLESS = 'true',
   TRN_COOKIE_TTL_MIN = '60',
-  TRN_CF_WAIT_MS = '5000',
-  TRN_NAV_TIMEOUT_MS = '30000',
+  TRN_CF_WAIT_MS = '12000',
+  TRN_NAV_TIMEOUT_MS = '45000',
   CHROME_EXE,
 } = process.env;
 
