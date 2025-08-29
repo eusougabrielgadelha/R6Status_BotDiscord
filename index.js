@@ -1,763 +1,881 @@
-// topo do index.js (ESM)
+// index.js
+// ------------------------------------------------------------
+// Bot R6 Tracker — Relatórios & Rankings (TRN) com Slash + Prefixo
+// Agendamentos: diário (relatório), semanal/mensal (rankings) por guild
+// Persistência: SQLite (jogadores e horários)
+// Scraping: Cheerio diretamente do perfil TRN
+// ------------------------------------------------------------
+
 import dotenv from 'dotenv';
-dotenv.config({ quiet: true }); // silencia os logs “injecting env”
+dotenv.config({ quiet: true }); // silencia logs do dotenv
 
 import {
-  Client, GatewayIntentBits, Partials, REST, Routes, EmbedBuilder,
+  Client,
+  GatewayIntentBits,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+  PermissionFlagsBits,
+  EmbedBuilder,
+  ChannelType,
+  Partials,
 } from 'discord.js';
 import cron from 'node-cron';
-import fs from 'node:fs';
-import path from 'node:path';
+import Database from 'better-sqlite3';
+import { DateTime } from 'luxon';
 import * as cheerio from 'cheerio';
 
-// -----------------------------------------------------------------------------
-// 2) Configurações
-const TOKEN = process.env.DISCORD_TOKEN;
-const APP_ID = process.env.APP_ID;
-const GUILD_ID = process.env.GUILD_ID; // opcional (registro de /comandos no servidor)
-const PREFIX = process.env.PREFIX || '!';
-const TIMEZONE = process.env.TIMEZONE || 'America/Sao_Paulo';
-const PLAYERS =
-  (process.env.PLAYERS || '')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean);
+// -------------------------------
+// .env
+// -------------------------------
+const {
+  DISCORD_TOKEN,
+  GUILD_ID,         // opcional (registro de slash em uma guild)
+  GUILD_IDS,        // opcional (lista separada por vírgula)
+  PREFIX = '!',
+} = process.env;
 
-// Arquivo para persistir agendamentos por servidor
-const DATA_DIR = path.resolve('./data');
-const SCHEDULE_FILE = path.join(DATA_DIR, 'schedules.json');
+// Fuso: aceita TZ (compat Node) ou TIMEZONE (compat anteriores)
+const TZ = process.env.TZ || process.env.TIMEZONE || 'America/Sao_Paulo';
 
-if (!TOKEN) {
-  console.error('❌ DISCORD_TOKEN ausente no .env');
+if (!DISCORD_TOKEN) {
+  console.error('❌ Falta DISCORD_TOKEN no .env');
   process.exit(1);
 }
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-if (!fs.existsSync(SCHEDULE_FILE)) fs.writeFileSync(SCHEDULE_FILE, JSON.stringify({}), 'utf8');
 
-// -----------------------------------------------------------------------------
-// 3) Cliente do Discord
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-  ],
-  partials: [Partials.Channel],
-});
+// -------------------------------
+/* DB (SQLite) */
+// -------------------------------
+const db = new Database('r6bot.db');
+db.pragma('journal_mode = WAL');
 
-// -----------------------------------------------------------------------------
-// 4) Utilidades de data / hora
-const MONTHS_EN = {
-  Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5,
-  Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11,
-};
-function toDateKey(d) {
-  // yyyy-mm-dd no fuso configurado (vamos normalizar para meia-noite local)
-  const d2 = new Date(d);
-  const yyyy = d2.getFullYear();
-  const mm = String(d2.getMonth() + 1).padStart(2, '0');
-  const dd = String(d2.getDate()).padStart(2, '0');
-  return `${yyyy}-${mm}-${dd}`;
-}
-function nowTz() {
-  // Data atual como objeto Date ajustado pelo fuso no formato "yyyy-MM-ddTHH:mm:ss"
-  // Para comparação de dias, usaremos apenas ano/mês/dia.
-  return new Date(new Date().toLocaleString('en-US', { timeZone: TIMEZONE }));
-}
-function startOfDayTz(d) {
-  const nd = new Date(d);
-  nd.setHours(0, 0, 0, 0);
-  return nd;
-}
-function addDays(d, n) {
-  const z = new Date(d);
-  z.setDate(z.getDate() + n);
-  return z;
-}
-function lastWeekRange(refDate = nowTz()) {
-  // Segunda a Domingo da semana ANTERIOR ao refDate
-  const day = refDate.getDay(); // 0=Domingo
-  const thisMonday = addDays(startOfDayTz(refDate), -((day + 6) % 7));
-  const lastMonday = addDays(thisMonday, -7);
-  const lastSunday = addDays(lastMonday, 6);
-  return { start: lastMonday, end: lastSunday };
-}
-function lastMonthRange(refDate = nowTz()) {
-  const y = refDate.getFullYear();
-  const m = refDate.getMonth();
-  // mês anterior
-  const start = new Date(y, m - 1, 1);
-  const end = new Date(y, m, 0); // último dia do mês anterior
-  start.setHours(0, 0, 0, 0);
-  end.setHours(23, 59, 59, 999);
-  return { start, end };
-}
-function parseMonthDayEn(text) {
-  // Ex.: "Aug 29" → Date (ano inferido)
-  const m = text.trim().match(/^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})$/);
+db.exec(`
+CREATE TABLE IF NOT EXISTS players (
+  guild_id TEXT NOT NULL,
+  username TEXT NOT NULL,
+  PRIMARY KEY (guild_id, username)
+);
+
+CREATE TABLE IF NOT EXISTS schedules (
+  guild_id TEXT NOT NULL,
+  channel_id TEXT NOT NULL,
+  time_str TEXT NOT NULL,     -- "HH:mm" (24h)
+  PRIMARY KEY (guild_id)
+);
+`);
+
+const qInsertPlayer   = db.prepare('INSERT OR IGNORE INTO players (guild_id, username) VALUES (?, ?)');
+const qDeletePlayer   = db.prepare('DELETE FROM players WHERE guild_id = ? AND username = ?');
+const qListPlayers    = db.prepare('SELECT username FROM players WHERE guild_id = ? ORDER BY username COLLATE NOCASE');
+const qUpsertSchedule = db.prepare(`
+  INSERT INTO schedules (guild_id, channel_id, time_str)
+  VALUES (?, ?, ?)
+  ON CONFLICT(guild_id) DO UPDATE SET channel_id=excluded.channel_id, time_str=excluded.time_str
+`);
+const qGetSchedule    = db.prepare('SELECT channel_id, time_str FROM schedules WHERE guild_id = ?');
+const qDelSchedule    = db.prepare('DELETE FROM schedules WHERE guild_id = ?');
+const qAllSchedules   = db.prepare('SELECT guild_id FROM schedules');
+
+// -------------------------------
+// Scraper TRN (perfil público)
+// Retorna blocos diários agregados (wins, losses, k, d, hs_pct)
+// -------------------------------
+const MONTHS_EN = { Jan:1, Feb:2, Mar:3, Apr:4, May:5, Jun:6, Jul:7, Aug:8, Sep:9, Oct:10, Nov:11, Dec:12 };
+
+function toISOFromLabel(label, now = DateTime.now().setZone(TZ)) {
+  // "Aug 29" → "yyyy-MM-dd"
+  const m = /^\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\s*$/.exec(label || '');
   if (!m) return null;
-  const now = nowTz();
-  let year = now.getFullYear();
+  let year = now.year;
   const month = MONTHS_EN[m[1]];
-  const day = parseInt(m[2], 10);
-
-  // Se estamos em janeiro e a página mostra Dezembro, pode ser do ano anterior
-  if (now.getMonth() === 0 && month === 11) year = now.getFullYear() - 1;
-
-  const dt = new Date(year, month, day);
-  dt.setHours(0, 0, 0, 0);
-  return dt;
-}
-function formatPct(v) {
-  if (isNaN(v)) return '0%';
-  return `${(v * 100).toFixed(1)}%`;
-}
-function safeDiv(a, b) {
-  if (!b) return a > 0 ? Infinity : 0;
-  return a / b;
+  const day = Number(m[2]);
+  let dt = DateTime.fromObject({ year, month, day }, { zone: TZ });
+  // Se estivermos em Jan e o label for Dez, ajusta ano anterior
+  if (now.month === 1 && month === 12) dt = dt.minus({ years: 1 });
+  return dt.toISODate();
 }
 
-// -----------------------------------------------------------------------------
-// 5) Scraper R6 Tracker (perfil público)
-//    URL base: https://r6.tracker.network/profile/pc/<NICK>
-//    Pegamos os blocos por dia (Aug 29, Aug 28, ...), e para cada partida
-//    extraímos W/L, K/D/A, HS%.
-// -----------------------------------------------------------------------------
-async function fetchProfileHtml(nick) {
-  const url = `https://r6.tracker.network/profile/pc/${encodeURIComponent(nick)}`;
+async function fetchProfileHtml(username) {
+  const url = `https://r6.tracker.network/profile/pc/${encodeURIComponent(username)}`;
   const res = await fetch(url, {
     headers: {
       'User-Agent':
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36',
-      Accept: 'text/html,application/xhtml+xml',
+      'Accept': 'text/html,application/xhtml+xml',
     },
   });
-  if (!res.ok) throw new Error(`Falha ao carregar perfil ${nick}: ${res.status}`);
-  return await res.text();
+  if (!res.ok) throw new Error(`Falha ao carregar perfil ${username}: HTTP ${res.status}`);
+  return { url, html: await res.text() };
 }
 
 /**
- * Retorna um mapa { 'YYYY-MM-DD': [ { win, kills, deaths, hsPct } ... ] }
+ * scrapeDailyBlocks(username)
+ * → { url, blocks: [ { dateLabel, iso, wins, losses, k, d, hs_pct } ] }
+ *  - hs_pct em 0–100 (média simples das partidas do dia)
  */
-async function getMatchesByDay(nick) {
-  const html = await fetchProfileHtml(nick);
+async function scrapeDailyBlocks(username) {
+  const { url, html } = await fetchProfileHtml(username);
   const $ = cheerio.load(html);
 
-  const result = {};
-
-  // Cada "dia" fica num container que tem um <header> com o texto tipo "Aug 29"
+  const blocks = [];
+  // Cada "dia" fica em uma seção com header "Aug 29", etc. (layout TRN v3)
   $('div.col-span-full.grid.grid-cols-subgrid.gap-5').each((_, section) => {
-    const headerText = $(section).find('header .text-18.font-bold.text-secondary').first().text().trim();
-    const dt = parseMonthDayEn(headerText);
-    if (!dt) return;
+    const header = $(section).find('header .text-18.font-bold.text-secondary').first().text().trim();
+    const iso = toISOFromLabel(header);
+    if (!iso) return;
 
-    const dateKey = toDateKey(dt);
-    const dayMatches = [];
+    let wins = 0, losses = 0, kSum = 0, dSum = 0;
+    let hsAcc = 0, hsN = 0;
 
-    // Dentro do mesmo container, todas as linhas de partida:
-    $(section)
-      .find('.v3-match-row')
-      .each((__, row) => {
-        const $row = $(row);
-        const isWin = $row.hasClass('v3-match-row--win');
+    $(section).find('.v3-match-row').each((__, row) => {
+      const $row = $(row);
+      const isWin = $row.hasClass('v3-match-row--win');
+      if (isWin) wins++; else losses++;
 
-        // K/D/A
-        let kills = 0, deaths = 0;
-        const kdList = $row.find('.v3-separate-slash .value');
-        if (kdList.length >= 2) {
-          kills = parseInt($(kdList[0]).text().trim(), 10) || 0;
-          deaths = parseInt($(kdList[1]).text().trim(), 10) || 0;
-        } else {
-          // fallback: tenta pegar o "K/D" arredondado e inferir com deaths=1 (pouco provável, mas evita NaN)
-          const kdTxt = $row.find('.stat-name:contains("K/D")').parent().find('.stat-value').first().text().trim();
-          const kd = parseFloat(kdTxt.replace(',', '.')) || 0;
-          deaths = kd > 0 ? 1 : 0;
-          kills = Math.round(kd * deaths);
-        }
+      // K / D
+      const kdList = $row.find('.v3-separate-slash .value');
+      let k = 0, d = 0;
+      if (kdList.length >= 2) {
+        k = parseInt($(kdList[0]).text().trim(), 10) || 0;
+        d = parseInt($(kdList[1]).text().trim(), 10) || 0;
+      } else {
+        // fallback leve
+        const kdTxt = $row.find('.stat-name:contains("K/D")').parent().find('.stat-value').first().text().trim();
+        const kd = parseFloat(kdTxt.replace(',', '.')) || 0;
+        d = kd > 0 ? 1 : 0;
+        k = Math.round(kd * d);
+      }
+      kSum += k;
+      dSum += d;
 
-        // HS %
-        let hsPct = 0;
-        const hsTxt = $row
-          .find('.stat-name:contains("HS")')
-          .parent()
-          .find('.stat-value')
-          .first()
-          .text()
-          .trim()
-          .replace('%', '')
-          .replace(',', '.');
-        const hsParsed = parseFloat(hsTxt);
-        if (!isNaN(hsParsed)) hsPct = hsParsed / 100;
+      // HS%
+      const hsTxt = $row
+        .find('.stat-name:contains("HS")')
+        .parent()
+        .find('.stat-value')
+        .first()
+        .text()
+        .trim()
+        .replace('%', '')
+        .replace(',', '.');
+      const hs = parseFloat(hsTxt);
+      if (!Number.isNaN(hs)) {
+        hsAcc += hs;
+        hsN += 1;
+      }
+    });
 
-        dayMatches.push({ win: isWin, kills, deaths, hsPct });
-      });
-
-    if (dayMatches.length) {
-      result[dateKey] = (result[dateKey] || []).concat(dayMatches);
-    } else {
-      // Mesmo sem partidas listadas, marca o dia para sabermos que o bloco existia.
-      if (!result[dateKey]) result[dateKey] = [];
-    }
+    const hs_pct = hsN > 0 ? (hsAcc / hsN) : 0;
+    blocks.push({ dateLabel: header, iso, wins, losses, k: kSum, d: dSum, hs_pct });
   });
 
-  return result;
+  return { url, blocks };
 }
 
-// Agrega uma lista de partidas do período
-function aggregateMatches(matches) {
-  const total = {
-    matches: 0,
-    wins: 0,
-    kills: 0,
-    deaths: 0,
-    hsSum: 0,
-    hsCount: 0,
-  };
-  for (const m of matches) {
-    total.matches += 1;
-    if (m.win) total.wins += 1;
-    total.kills += m.kills;
-    total.deaths += m.deaths;
-    if (!isNaN(m.hsPct)) {
-      total.hsSum += m.hsPct;
-      total.hsCount += 1;
+// -------------------------------
+// Util: janelas canônicas e relativas
+// -------------------------------
+function filterBlocksByWindow(blocks, start, end) {
+  return blocks
+    .filter(b => !!b.iso)
+    .filter(b => {
+      const dt = DateTime.fromISO(b.iso, { zone: TZ }).endOf('day');
+      return dt >= start.startOf('day') && dt <= end.endOf('day');
+    });
+}
+
+// Para comandos interativos (não agendados): janelas relativas ao hoje
+function filterBlocksByRange(blocks, range, now = DateTime.now().setZone(TZ)) {
+  const today = now.startOf('day');
+  let start;
+  if (range === 'day') start = today;
+  else if (range === 'week') start = today.minus({ days: 6 });
+  else if (range === 'month') start = today.minus({ days: 29 });
+  else start = today;
+  const end = today.endOf('day');
+  return filterBlocksByWindow(blocks, start, end);
+}
+
+// Para agendamentos (janelas canônicas: semana/mês anteriores)
+function getCanonicalWindow(kind, now = DateTime.now().setZone(TZ)) {
+  if (kind === 'day') {
+    const start = now.startOf('day');
+    return { start, end: start.endOf('day') };
+  }
+  if (kind === 'week') {
+    // semana anterior completa (seg→dom) — ISO week
+    const prev = now.minus({ weeks: 1 });
+    const start = prev.startOf('week');
+    const end   = prev.endOf('week');
+    return { start, end };
+  }
+  if (kind === 'month') {
+    // mês anterior completo
+    const prev = now.minus({ months: 1 });
+    const start = prev.startOf('month');
+    const end   = prev.endOf('month');
+    return { start, end };
+  }
+  const start = now.startOf('day');
+  return { start, end: start.endOf('day') };
+}
+
+// -------------------------------
+// Agregação por jogador
+// -------------------------------
+function aggregate(blocks) {
+  // Soma total de K, D, W, L; KD = K_total/D_total; HS% ponderado por kills
+  let totalK = 0, totalD = 0, totalWins = 0, totalLosses = 0;
+  let hsShotsEst = 0;
+
+  for (const b of blocks) {
+    if (Number.isFinite(b.k)) totalK += b.k;
+    if (Number.isFinite(b.d)) totalD += b.d;
+    if (Number.isFinite(b.wins)) totalWins += b.wins;
+    if (Number.isFinite(b.losses)) totalLosses += b.losses;
+    if (Number.isFinite(b.hs_pct) && Number.isFinite(b.k)) {
+      // aproximação: HS% * kills do bloco
+      hsShotsEst += (b.hs_pct / 100) * b.k;
     }
   }
-  const kdAvg = safeDiv(total.kills, total.deaths);
-  const hsAvg = total.hsCount ? total.hsSum / total.hsCount : 0;
-  return { ...total, kdAvg, hsAvg };
+
+  const kdRaw = totalD > 0 ? totalK / totalD : (totalK > 0 ? Infinity : 0);
+  const kd = Number.isFinite(kdRaw) ? kdRaw : 0;
+  const hsPct = totalK > 0 ? (hsShotsEst / totalK) * 100 : 0;
+
+  return { wins: totalWins, losses: totalLosses, k: totalK, d: totalD, kd, hs_pct: hsPct, days: blocks.length };
 }
 
-// Coleta/Agrega para 1 jogador em um intervalo de datas (inclusive)
-async function collectPlayerPeriod(nick, startDate, endDate) {
-  const byDay = await getMatchesByDay(nick);
-  const keys = Object.keys(byDay);
-  const startKey = toDateKey(startDate);
-  const endKey = toDateKey(endDate);
-
-  // Todas as datas no range
-  const matches = [];
-  const playedDates = new Set();
-  for (const key of keys) {
-    if (key >= startKey && key <= endKey) {
-      const arr = byDay[key] || [];
-      if (arr.length > 0) playedDates.add(key);
-      matches.push(...arr);
-    }
-  }
-  const agg = aggregateMatches(matches);
-
-  // "Faltas" = nº de dias no período sem partidas (por dia civil no fuso TIMEZONE)
-  const daysInRange = [];
-  {
-    let d = startOfDayTz(startDate);
-    const end = startOfDayTz(endDate);
-    while (d <= end) {
-      daysInRange.push(toDateKey(d));
-      d = addDays(d, 1);
-    }
-  }
-  const faltas = daysInRange.filter(k => !playedDates.has(k)).length;
-
-  return { nick, ...agg, faltas, playedDates };
-}
-
-// -----------------------------------------------------------------------------
-// 6) Texto de ranking e report
-function formatRankingHeader(title, start, end) {
-  const sameDay = toDateKey(start) === toDateKey(end);
-  const d1 = toDateKey(start);
-  const d2 = toDateKey(end);
-  return `**${title}** ${sameDay ? `(${d1})` : `(${d1} → ${d2})`}`;
-}
-
-function pickWinners(items, field, desc = true) {
-  // devolve lista (podem haver empates)
-  let best = desc ? -Infinity : Infinity;
-  const out = [];
-  for (const it of items) {
-    const v = it[field];
-    if (v == null || isNaN(v)) continue;
-    if ((desc && v > best) || (!desc && v < best)) {
-      best = v;
-      out.length = 0;
-      out.push(it);
-    } else if (v === best) {
-      out.push(it);
-    }
-  }
-  return { best, out };
-}
-
-function formatWinnersRow(label, winners, field, options = {}) {
-  const { suffix = '', decimals = 2 } = options;
-  if (!winners.out.length || winners.best === -Infinity || winners.best === Infinity) {
-    return `• ${label}: —`;
-  }
-  const list = winners.out
-    .map(w => `${w.nick} - ${typeof w[field] === 'number' ? w[field].toFixed(decimals) : w[field]}${suffix}`)
-    .join(', ');
-  return `• ${label}: ${list}`;
-}
-
-function formatRankingEmbed(title, start, end, table) {
-  const embed = new EmbedBuilder()
-    .setTitle(`${title}`)
-    .setDescription(`${toDateKey(start)} → ${toDateKey(end)}`)
-    .addFields(table)
-    .setColor(0xF8AA2A)
+// -------------------------------
+// Embeds
+// -------------------------------
+function embedReport(rangeTitle, username, url, agg) {
+  return new EmbedBuilder()
+    .setTitle(`R6 — ${rangeTitle} • ${username}`)
+    .setURL(url)
+    .addFields(
+      { name: 'W/L', value: `${agg.wins} W • ${agg.losses} L`, inline: true },
+      { name: 'K/D', value: (agg.kd ?? 0).toFixed(2), inline: true },
+      { name: 'K · D', value: `${agg.k} · ${agg.d}`, inline: true },
+      { name: 'HS%', value: `${(agg.hs_pct ?? 0).toFixed(1)}%`, inline: true },
+      { name: 'Dias', value: `${agg.days}`, inline: true },
+    )
     .setTimestamp(new Date());
-  return embed;
 }
 
-function simpleListField(name, lines) {
-  return {
-    name,
-    value: lines.join('\n') || '—',
-    inline: false,
-  };
-}
+function embedRanking(rangeTitle, rankings) {
+  const fmt = (title, arr, f) =>
+    `**${title}**\n` + (arr.length ? arr.map((r, i) => `${i === 0 ? '🏆 ' : ''}${f(r)}`).join('\n') : '—');
 
-function formatPlayerReportEmbed(nick, start, end, agg) {
-  const kd = agg.kdAvg === Infinity ? '∞' : agg.kdAvg.toFixed(2);
-  const hs = formatPct(agg.hsAvg);
+  const desc = [
+    fmt('Quem mais matou', rankings.mostKills,  (r)=> `**${r.username}** — ${r.k}`),
+    fmt('Quem mais morreu', rankings.mostDeaths, (r)=> `**${r.username}** — ${r.d}`),
+    fmt('Melhor K/D',      rankings.bestKD,     (r)=> `**${r.username}** — ${r.kd.toFixed(2)}`),
+    fmt('Melhor HS%',      rankings.bestHS,     (r)=> `**${r.username}** — ${r.hs_pct.toFixed(1)}%`),
+    fmt('Quem mais venceu',rankings.mostWins,   (r)=> `**${r.username}** — ${r.wins}`),
+  ].join('\n\n');
 
   return new EmbedBuilder()
-    .setTitle(`Report de ${nick}`)
-    .setDescription(`${toDateKey(start)} → ${toDateKey(end)}`)
-    .addFields(
-      { name: 'Partidas', value: String(agg.matches), inline: true },
-      { name: 'Vitórias', value: String(agg.wins), inline: true },
-      { name: 'Kills', value: String(agg.kills), inline: true },
-      { name: 'Deaths', value: String(agg.deaths), inline: true },
-      { name: 'K/D médio', value: kd, inline: true },
-      { name: 'HS% médio', value: hs, inline: true },
-    )
-    .setColor(0x2B98F0)
+    .setTitle(`R6 — Ranking ${rangeTitle}`)
+    .setDescription(desc)
     .setTimestamp(new Date());
 }
 
-// -----------------------------------------------------------------------------
-// 7) Execução do ranking para um conjunto de players
-async function buildRanking(players, start, end) {
+// -------------------------------
+// Coleta (1 jogador / guild, com janelas)
+// -------------------------------
+async function collectForUserInWindow(username, start, end) {
+  const { url, blocks } = await scrapeDailyBlocks(username);
+  const filtered = filterBlocksByWindow(blocks, start, end);
+  const agg = aggregate(filtered);
+  return { username, url, agg, count: filtered.length };
+}
+
+async function collectForUser(username, range) {
+  const { url, blocks } = await scrapeDailyBlocks(username);
+  const filtered = filterBlocksByRange(blocks, range);
+  const agg = aggregate(filtered);
+  return { username, url, agg, count: filtered.length };
+}
+
+async function collectForGuild(guildId, range) {
+  const rows = qListPlayers.all(guildId);
   const results = [];
-  for (const p of players) {
+  for (const r of rows) {
     try {
-      const r = await collectPlayerPeriod(p, start, end);
-      results.push(r);
-    } catch (err) {
-      results.push({ nick: p, error: String(err), matches: 0, wins: 0, kills: 0, deaths: 0, kdAvg: 0, hsAvg: 0, faltas: NaN });
+      const one = await collectForUser(r.username, range);
+      results.push(one);
+    } catch (e) {
+      results.push({ username: r.username, error: true, err: e?.message || String(e) });
     }
   }
+  return results;
+}
 
-  // Tabelas (top/maior):
-  const faltasTop = pickWinners(results, 'faltas', true);
-  const mortesTop = pickWinners(results, 'deaths', true);
-  const kdTop = pickWinners(results, 'kdAvg', true);
-  const hsTop = pickWinners(results, 'hsAvg', true);
-  const vitoriasTop = pickWinners(results, 'wins', true);
+async function collectForGuildWindow(guildId, start, end) {
+  const rows = qListPlayers.all(guildId);
+  const results = [];
+  for (const r of rows) {
+    try {
+      const one = await collectForUserInWindow(r.username, start, end);
+      results.push(one);
+    } catch (e) {
+      results.push({ username: r.username, error: true, err: e?.message || String(e) });
+    }
+  }
+  return results;
+}
+
+// -------------------------------
+// Rankings (ordenações)
+// -------------------------------
+function buildRankings(collected) {
+  const flat = collected
+    .filter(c => !c.error)
+    .map(c => ({ username: c.username, ...c.agg }));
+
+  const by = (k) => (a,b)=> (b[k] - a[k]);
 
   return {
-    results,
-    faltasTop,
-    mortesTop,
-    kdTop,
-    hsTop,
-    vitoriasTop,
-    start,
-    end,
+    mostKills:  [...flat].sort(by('k')).slice(0, 5),
+    mostDeaths: [...flat].sort(by('d')).slice(0, 5),
+    bestKD:     [...flat].sort((a,b)=> b.kd - a.kd).slice(0, 5),
+    bestHS:     [...flat].sort((a,b)=> b.hs_pct - a.hs_pct).slice(0, 5),
+    mostWins:   [...flat].sort(by('wins')).slice(0, 5),
   };
 }
 
-function rankingToEmbed(title, r) {
-  const linhas = [
-    formatWinnersRow('Quem mais faltou?', r.faltasTop, 'faltas', { decimals: 0 }),
-    formatWinnersRow('Quem mais morreu?', r.mortesTop, 'deaths', { decimals: 0 }),
-    formatWinnersRow('Melhor K/D?', r.kdTop, 'kdAvg'),
-    formatWinnersRow('Melhor HS%?', r.hsTop, 'hsAvg', { suffix: '', decimals: 2 }),
-    formatWinnersRow('Quem mais venceu?', r.vitoriasTop, 'wins', { decimals: 0 }),
-  ];
+// -------------------------------
+// Cron por guild (3 tarefas)
+// -------------------------------
+const guildCrons = new Map(); // { guildId: { daily, weekly, monthly } }
 
-  return formatRankingEmbed(title, r.start, r.end, [
-    simpleListField('Rank', linhas),
-  ]);
+function parseHHmm(s) {
+  const m = /^([01]\d|2[0-3]):([0-5]\d)$/.exec((s||'').trim());
+  if (!m) return null;
+  return { hh: Number(m[1]), mm: Number(m[2]) };
 }
 
-// -----------------------------------------------------------------------------
-// 8) Comandos de texto (prefixo "!")
-// -----------------------------------------------------------------------------
-function isCommand(msg, name) {
-  return msg.content.toLowerCase().startsWith(`${PREFIX}${name}`);
+function stopCronsForGuild(guildId) {
+  const entry = guildCrons.get(guildId);
+  if (!entry) return;
+  entry.daily?.stop?.();
+  entry.weekly?.stop?.();
+  entry.monthly?.stop?.();
+  guildCrons.delete(guildId);
 }
 
-function helpText() {
-  return [
-    `**Comandos (prefixo \`${PREFIX}\`)**`,
-    '',
-    `• \`${PREFIX}help\` — mostra esta ajuda.`,
-    `• \`${PREFIX}daily_ranking\` — ranking do **dia de hoje** para os jogadores configurados em \`PLAYERS\`.`,
-    `• \`${PREFIX}yesterday_ranking\` — ranking de **ontem** (o script diferencia hoje/ontem pelos blocos de data do R6 Tracker).`,
-    `• \`${PREFIX}weekly_ranking\` — ranking da **semana anterior** (Seg → Dom).`,
-    `• \`${PREFIX}monthly_ranking\` — ranking do **mês anterior** (1º ao último dia).`,
-    '',
-    `• \`${PREFIX}daily_report <nick>\` — report individual **de hoje** para o jogador.`,
-    `• \`${PREFIX}weekly_report <nick>\` — report individual da **semana anterior**.`,
-    `• \`${PREFIX}monthly_report <nick>\` — report individual do **mês anterior**.`,
-    '',
-    `• \`${PREFIX}programar <channelId> <HH:MM>\` — programa envios automáticos no canal:`,
-    `    - **diário**: \`${PREFIX}daily_ranking\` todos os dias no horário.`,
-    `    - **semanal**: \`${PREFIX}weekly_ranking\` toda segunda-feira (semana anterior).`,
-    `    - **mensal**: \`${PREFIX}monthly_ranking\` todo dia 1 (mês anterior).`,
-    `   Fuso usado: **${TIMEZONE}**.`,
-    `• \`${PREFIX}cancelar-programação\` — remove os envios automáticos do servidor atual.`,
-    '',
-    `**Observações**`,
-    `- A lista de jogadores vem de \`PLAYERS\` no \`.env\` (separados por vírgula).`,
-    `- “Faltas” = quantidade de **dias** no período sem partidas no R6 Tracker.`,
-  ].join('\n');
-}
+async function installCronsForGuild(client, guildId) {
+  const row = qGetSchedule.get(guildId);
+  if (!row) return;
+  const { channel_id, time_str } = row;
+  const parsed = parseHHmm(time_str);
+  if (!parsed) return;
 
-// Funções de período “sem ambiguidades”
-function todayRange() {
-  const d = nowTz();
-  const start = startOfDayTz(d);
-  const end = new Date(start);
-  end.setHours(23, 59, 59, 999);
-  return { start, end };
-}
-function yesterdayRange() {
-  const t = startOfDayTz(nowTz());
-  const y = addDays(t, -1);
-  const start = y;
-  const end = new Date(y);
-  end.setHours(23, 59, 59, 999);
-  return { start, end };
-}
+  // stop anteriores
+  stopCronsForGuild(guildId);
 
-client.on('messageCreate', async (msg) => {
-  if (msg.author.bot) return;
-  if (!msg.content.startsWith(PREFIX)) return;
+  const dailyExpr   = `${parsed.mm} ${parsed.hh} * * *`;    // todo dia
+  const weeklyExpr  = `${parsed.mm} ${parsed.hh} * * 1`;    // segunda-feira
+  const monthlyExpr = `${parsed.mm} ${parsed.hh} 1 * *`;    // dia 1
 
-  // HELP
-  if (isCommand(msg, 'help')) {
-    await msg.channel.send({ content: helpText() });
-    return;
-  }
+  const daily = cron.schedule(dailyExpr, async () => {
+    try {
+      const ch = await client.channels.fetch(channel_id);
+      if (!ch?.isTextBased()) return;
 
-  // RANKING — HOJE
-  if (isCommand(msg, 'daily_ranking')) {
-    if (!PLAYERS.length) return void msg.reply('Configure `PLAYERS` no .env.');
-    const { start, end } = todayRange();
-    await msg.channel.send('Gerando ranking do dia…');
-    const r = await buildRanking(PLAYERS, start, end);
-    const embed = rankingToEmbed('Rank do dia', r);
-    await msg.channel.send({ embeds: [embed] });
-    return;
-  }
-
-  // RANKING — ONTEM
-  if (isCommand(msg, 'yesterday_ranking')) {
-    if (!PLAYERS.length) return void msg.reply('Configure `PLAYERS` no .env.');
-    const { start, end } = yesterdayRange();
-    await msg.channel.send('Gerando ranking de ontem…');
-    const r = await buildRanking(PLAYERS, start, end);
-    const embed = rankingToEmbed('Rank de Ontem', r);
-    await msg.channel.send({ embeds: [embed] });
-    return;
-  }
-
-  // RANKING — SEMANA ANTERIOR
-  if (isCommand(msg, 'weekly_ranking')) {
-    if (!PLAYERS.length) return void msg.reply('Configure `PLAYERS` no .env.');
-    const { start, end } = lastWeekRange(nowTz());
-    await msg.channel.send('Gerando ranking semanal (semana anterior)…');
-    const r = await buildRanking(PLAYERS, start, end);
-    const embed = rankingToEmbed('Rank Semanal (semana anterior)', r);
-    await msg.channel.send({ embeds: [embed] });
-    return;
-  }
-
-  // RANKING — MÊS ANTERIOR
-  if (isCommand(msg, 'monthly_ranking')) {
-    if (!PLAYERS.length) return void msg.reply('Configure `PLAYERS` no .env.');
-    const { start, end } = lastMonthRange(nowTz());
-    await msg.channel.send('Gerando ranking mensal (mês anterior)…');
-    const r = await buildRanking(PLAYERS, start, end);
-    const embed = rankingToEmbed('Rank Mensal (mês anterior)', r);
-    await msg.channel.send({ embeds: [embed] });
-    return;
-  }
-
-  // REPORTS INDIVIDUAIS
-  // daily_report <nick>
-  if (isCommand(msg, 'daily_report')) {
-    const nick = msg.content.split(/\s+/)[1];
-    if (!nick) return void msg.reply(`Uso: \`${PREFIX}daily_report <nick>\``);
-    const { start, end } = todayRange();
-    await msg.channel.send(`Gerando report de **${nick}** (hoje)…`);
-    const r = await collectPlayerPeriod(nick, start, end);
-    const embed = formatPlayerReportEmbed(nick, start, end, r);
-    await msg.channel.send({ embeds: [embed] });
-    return;
-  }
-  if (isCommand(msg, 'weekly_report')) {
-    const nick = msg.content.split(/\s+/)[1];
-    if (!nick) return void msg.reply(`Uso: \`${PREFIX}weekly_report <nick>\``);
-    const { start, end } = lastWeekRange(nowTz());
-    await msg.channel.send(`Gerando report de **${nick}** (semana anterior)…`);
-    const r = await collectPlayerPeriod(nick, start, end);
-    const embed = formatPlayerReportEmbed(nick, start, end, r);
-    await msg.channel.send({ embeds: [embed] });
-    return;
-  }
-  if (isCommand(msg, 'monthly_report')) {
-    const nick = msg.content.split(/\s+/)[1];
-    if (!nick) return void msg.reply(`Uso: \`${PREFIX}monthly_report <nick>\``);
-    const { start, end } = lastMonthRange(nowTz());
-    await msg.channel.send(`Gerando report de **${nick}** (mês anterior)…`);
-    const r = await collectPlayerPeriod(nick, start, end);
-    const embed = formatPlayerReportEmbed(nick, start, end, r);
-    await msg.channel.send({ embeds: [embed] });
-    return;
-  }
-
-  // PROGRAMAÇÃO
-  if (isCommand(msg, 'programar')) {
-    const [, channelId, hhmm] = msg.content.trim().split(/\s+/);
-    if (!channelId || !/^\d{2}:\d{2}$/.test(hhmm || '')) {
-      return void msg.reply(`Uso: \`${PREFIX}programar <channelId> <HH:MM>\``);
+      const { start, end } = getCanonicalWindow('day');
+      const results = await collectForGuildWindow(guildId, start, end);
+      if (!results.length) {
+        await ch.send('Nenhum jogador cadastrado. Use `/cadastrar nick`.');
+        return;
+      }
+      for (const r of results) {
+        if (r.error) await ch.send(`❌ Falha em **${r.username}** — ${r.err || 'erro'}`);
+        else await ch.send({ embeds: [embedReport('Hoje', r.username, r.url, r.agg)] });
+      }
+    } catch (e) {
+      console.error('Falha no cron diário:', e);
     }
-    const schedules = JSON.parse(fs.readFileSync(SCHEDULE_FILE, 'utf8'));
-    schedules[msg.guild.id] = { channelId, hhmm };
-    fs.writeFileSync(SCHEDULE_FILE, JSON.stringify(schedules, null, 2));
-    await setupGuildCrons(msg.guild.id, channelId, hhmm);
-    await msg.reply(`Agendado: diário (todos os dias), semanal (toda segunda) e mensal (todo dia 1) às **${hhmm}** em <#${channelId}> (${TIMEZONE}).`);
-    return;
-  }
+  }, { timezone: TZ });
 
-  if (isCommand(msg, 'cancelar-programação')) {
-    const schedules = JSON.parse(fs.readFileSync(SCHEDULE_FILE, 'utf8'));
-    delete schedules[msg.guild.id];
-    fs.writeFileSync(SCHEDULE_FILE, JSON.stringify(schedules, null, 2));
-    cancelGuildCrons(msg.guild.id);
-    await msg.reply('Programações removidas para este servidor.');
-    return;
-  }
+  const weekly = cron.schedule(weeklyExpr, async () => {
+    try {
+      const ch = await client.channels.fetch(channel_id);
+      if (!ch?.isTextBased()) return;
+
+      const now = DateTime.now().setZone(TZ);
+      const { start, end } = getCanonicalWindow('week', now);
+      const results = await collectForGuildWindow(guildId, start, end);
+      if (!results.length) {
+        await ch.send('Nenhum jogador cadastrado. Use `/cadastrar nick`.');
+        return;
+      }
+      const rk = buildRankings(results);
+      await ch.send({ embeds: [embedRanking(`— Semana Anterior (${start.toFormat('dd/LL')}–${end.toFormat('dd/LL')})`, rk)] });
+    } catch (e) {
+      console.error('Falha no cron semanal:', e);
+    }
+  }, { timezone: TZ });
+
+  const monthly = cron.schedule(monthlyExpr, async () => {
+    try {
+      const ch = await client.channels.fetch(channel_id);
+      if (!ch?.isTextBased()) return;
+
+      const now = DateTime.now().setZone(TZ);
+      const { start, end } = getCanonicalWindow('month', now);
+      const results = await collectForGuildWindow(guildId, start, end);
+      if (!results.length) {
+        await ch.send('Nenhum jogador cadastrado. Use `/cadastrar nick`.');
+        return;
+      }
+      const rk = buildRankings(results);
+      await ch.send({ embeds: [embedRanking(`— Mês Anterior (${start.toFormat('LL/yyyy')})`, rk)] });
+    } catch (e) {
+      console.error('Falha no cron mensal:', e);
+    }
+  }, { timezone: TZ });
+
+  guildCrons.set(guildId, { daily, weekly, monthly });
+  console.log(`🕒 Cronos instalados para guild ${guildId} @ ${time_str} (${TZ}) [daily/weekly/monthly]`);
+}
+
+async function installAllCrons(client) {
+  const rows = qAllSchedules.all();
+  for (const r of rows) await installCronsForGuild(client, r.guild_id);
+}
+
+// -------------------------------
+/* Discord client + slash */
+// -------------------------------
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,   // prefixo
+    GatewayIntentBits.MessageContent,  // conteúdo (ative no portal!)
+  ],
+  partials: [Partials.Channel],
 });
 
-// -----------------------------------------------------------------------------
-// 9) Cron jobs por servidor (carregam no boot)
-// -----------------------------------------------------------------------------
-const guildCronJobs = new Map(); // guildId -> { daily, weekly, monthly }
-
-function cancelGuildCrons(guildId) {
-  const entry = guildCronJobs.get(guildId);
-  if (!entry) return;
-  for (const key of Object.keys(entry)) {
-    try { entry[key]?.stop?.(); } catch {}
-  }
-  guildCronJobs.delete(guildId);
-}
-
-async function setupGuildCrons(guildId, channelId, hhmm) {
-  cancelGuildCrons(guildId);
-
-  const [hour, minute] = hhmm.split(':').map(Number);
-
-  const daily = cron.schedule(
-    `${minute} ${hour} * * *`,
-    async () => {
-      try {
-        const ch = await client.channels.fetch(channelId);
-        if (!ch) return;
-        if (!PLAYERS.length) return void ch.send('Configure `PLAYERS` no .env.');
-        const { start, end } = todayRange();
-        const r = await buildRanking(PLAYERS, start, end);
-        const embed = rankingToEmbed('Rank do dia', r);
-        await ch.send({ embeds: [embed] });
-      } catch (e) {
-        console.error('Cron diário erro:', e);
-      }
-    },
-    { timezone: TIMEZONE }
-  );
-
-  const weekly = cron.schedule(
-    `${minute} ${hour} * * 1`, // segunda-feira
-    async () => {
-      try {
-        const ch = await client.channels.fetch(channelId);
-        if (!ch) return;
-        if (!PLAYERS.length) return void ch.send('Configure `PLAYERS` no .env.');
-        const { start, end } = lastWeekRange(nowTz());
-        const r = await buildRanking(PLAYERS, start, end);
-        const embed = rankingToEmbed('Rank Semanal (semana anterior)', r);
-        await ch.send({ embeds: [embed] });
-      } catch (e) {
-        console.error('Cron semanal erro:', e);
-      }
-    },
-    { timezone: TIMEZONE }
-  );
-
-  const monthly = cron.schedule(
-    `${minute} ${hour} 1 * *`, // dia 1 de cada mês
-    async () => {
-      try {
-        const ch = await client.channels.fetch(channelId);
-        if (!ch) return;
-        if (!PLAYERS.length) return void ch.send('Configure `PLAYERS` no .env.');
-        const { start, end } = lastMonthRange(nowTz());
-        const r = await buildRanking(PLAYERS, start, end);
-        const embed = rankingToEmbed('Rank Mensal (mês anterior)', r);
-        await ch.send({ embeds: [embed] });
-      } catch (e) {
-        console.error('Cron mensal erro:', e);
-      }
-    },
-    { timezone: TIMEZONE }
-  );
-
-  guildCronJobs.set(guildId, { daily, weekly, monthly });
-}
-
-function loadSchedulesAndSetup() {
-  const schedules = JSON.parse(fs.readFileSync(SCHEDULE_FILE, 'utf8'));
-  for (const [guildId, { channelId, hhmm }] of Object.entries(schedules)) {
-    setupGuildCrons(guildId, channelId, hhmm).catch(console.error);
-  }
-}
-
-// -----------------------------------------------------------------------------
-// 10) Registro opcional de Slash Commands (desabilitado por padrão)
-//     Para evitar "Missing Access (50001)" em ambientes sem escopo apropriado.
-// -----------------------------------------------------------------------------
-const REGISTER_SLASH = process.env.REGISTER_SLASH === '1';
-
+// Slash commands
 const slashCommands = [
-  {
-    name: 'help',
-    description: 'Mostra ajuda',
-  },
-  {
-    name: 'daily_ranking',
-    description: 'Ranking do dia (jogadores de PLAYERS)',
-  },
-  {
-    name: 'yesterday_ranking',
-    description: 'Ranking de ontem (jogadores de PLAYERS)',
-  },
-  {
-    name: 'weekly_ranking',
-    description: 'Ranking da semana anterior',
-  },
-  {
-    name: 'monthly_ranking',
-    description: 'Ranking do mês anterior',
-  },
-  {
-    name: 'daily_report',
-    description: 'Report diário de um jogador',
-    options: [{ name: 'nick', description: 'Nick do jogador', type: 3, required: true }],
-  },
-  {
-    name: 'weekly_report',
-    description: 'Report semanal de um jogador (semana anterior)',
-    options: [{ name: 'nick', description: 'Nick do jogador', type: 3, required: true }],
-  },
-  {
-    name: 'monthly_report',
-    description: 'Report mensal de um jogador (mês anterior)',
-    options: [{ name: 'nick', description: 'Nick do jogador', type: 3, required: true }],
-  },
-];
+  new SlashCommandBuilder()
+    .setName('cadastrar')
+    .setDescription('Cadastrar um jogador (nick Ubisoft) para rastrear')
+    .addStringOption(o => o.setName('nick').setDescription('Nick na Ubisoft').setRequired(true))
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+
+  new SlashCommandBuilder()
+    .setName('programar')
+    .setDescription('Programar envios: diário (relatório), semanal e mensal (rankings) no mesmo horário')
+    .addChannelOption(o =>
+      o.setName('canal').setDescription('Canal de destino').addChannelTypes(ChannelType.GuildText).setRequired(true)
+    )
+    .addStringOption(o =>
+      o.setName('horario').setDescription('Horário HH:mm (24h) no fuso configurado').setRequired(true)
+    )
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+
+  new SlashCommandBuilder()
+    .setName('cancelar_programacao')
+    .setDescription('Cancelar todos os envios programados desta guild')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+
+  new SlashCommandBuilder()
+    .setName('daily_report')
+    .setDescription('Relatório de HOJE (todos ou 1 nick específico)')
+    .addStringOption(o => o.setName('nick').setDescription('Nick Ubisoft (opcional, 1 jogador)').setRequired(false)),
+
+  new SlashCommandBuilder()
+    .setName('weekly_report')
+    .setDescription('Relatório dos ÚLTIMOS 7 DIAS (todos ou 1 nick específico)')
+    .addStringOption(o => o.setName('nick').setDescription('Nick Ubisoft (opcional, 1 jogador)').setRequired(false)),
+
+  new SlashCommandBuilder()
+    .setName('monthly_report')
+    .setDescription('Relatório dos ÚLTIMOS 30 DIAS (todos ou 1 nick específico)')
+    .addStringOption(o => o.setName('nick').setDescription('Nick Ubisoft (opcional, 1 jogador)').setRequired(false)),
+
+  new SlashCommandBuilder().setName('daily_ranking').setDescription('Ranking de HOJE'),
+  new SlashCommandBuilder().setName('weekly_ranking').setDescription('Ranking dos ÚLTIMOS 7 DIAS'),
+  new SlashCommandBuilder().setName('monthly_ranking').setDescription('Ranking dos ÚLTIMOS 30 DIAS'),
+].map(c => c.toJSON());
 
 async function registerSlashCommands() {
-  if (!REGISTER_SLASH || !APP_ID || !GUILD_ID) return;
-  const rest = new REST({ version: '10' }).setToken(TOKEN);
-  try {
-    await rest.put(Routes.applicationGuildCommands(APP_ID, GUILD_ID), { body: slashCommands });
-    console.log('✅ Slash commands registrados no servidor.');
-  } catch (err) {
-    console.warn('⚠️ Falha ao registrar slash (provável Missing Access):', err?.message || err);
+  const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
+  // aguarda client ready para ter application id
+  const app = await client.application?.fetch();
+  const appId = app?.id || client.user.id;
+
+  const list = (GUILD_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (list.length) {
+    for (const gid of list) {
+      await rest.put(Routes.applicationGuildCommands(appId, gid), { body: slashCommands });
+      console.log(`✅ Comandos registrados na guild ${gid}.`);
+    }
+  } else if (GUILD_ID) {
+    await rest.put(Routes.applicationGuildCommands(appId, GUILD_ID), { body: slashCommands });
+    console.log(`✅ Comandos registrados na guild ${GUILD_ID}.`);
+  } else {
+    await rest.put(Routes.applicationCommands(appId), { body: slashCommands });
+    console.log('🌐 Comandos registrados globalmente (podem demorar a aparecer).');
   }
 }
 
-client.on('interactionCreate', async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
+client.once('ready', async () => {
+  console.log(`✅ Logado como ${client.user.tag}`);
+  for (const g of client.guilds.cache.values()) {
+    console.log(`- ${g.name} (${g.id})`);
+  }
+  await registerSlashCommands();
+  await installAllCrons(client);
+});
 
-  const name = interaction.commandName;
-  try {
-    if (name === 'help') {
-      await interaction.reply({ content: helpText(), ephemeral: true });
+// -------------------------------
+// Helper de confirmação (slash)
+// -------------------------------
+async function confirm(ix, message, { ephemeral = false, edit = false } = {}) {
+  const payload = typeof message === 'string' ? { content: message } : message;
+  if (edit) return ix.editReply(payload);
+  if (ix.deferred || ix.replied) return ix.followUp({ ...payload, ephemeral });
+  return ix.reply({ ...payload, ephemeral });
+}
+
+// -------------------------------
+// Handler: SLASH
+// -------------------------------
+client.on('interactionCreate', async (ix) => {
+  if (!ix.isChatInputCommand()) return;
+
+  const name = ix.commandName;
+  const guildId = ix.guildId;
+
+  // /cadastrar (admin)
+  if (name === 'cadastrar') {
+    if (!ix.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+      await confirm(ix, '❌ Apenas admins (Manage Server) podem cadastrar jogadores.', { ephemeral: true });
       return;
     }
-    if (name === 'daily_ranking') {
-      if (!PLAYERS.length) return void interaction.reply('Configure `PLAYERS` no .env.');
-      const { start, end } = todayRange();
-      await interaction.reply('Gerando ranking do dia…');
-      const r = await buildRanking(PLAYERS, start, end);
-      await interaction.editReply({ embeds: [rankingToEmbed('Rank do dia', r)] });
+    const nick = ix.options.getString('nick', true).trim();
+    if (!nick) {
+      await confirm(ix, 'Uso: `/cadastrar nick`', { ephemeral: true });
       return;
     }
-    if (name === 'yesterday_ranking') {
-      if (!PLAYERS.length) return void interaction.reply('Configure `PLAYERS` no .env.');
-      const { start, end } = yesterdayRange();
-      await interaction.reply('Gerando ranking de ontem…');
-      const r = await buildRanking(PLAYERS, start, end);
-      await interaction.editReply({ embeds: [rankingToEmbed('Rank de Ontem', r)] });
+    qInsertPlayer.run(guildId, nick);
+    const total = qListPlayers.all(guildId).length;
+    await confirm(ix, `✅ **${nick}** cadastrado.\n📚 Jogadores: **${total}**.`, { ephemeral: true });
+    return;
+  }
+
+  // /programar (admin) -> instala 3 crons
+  if (name === 'programar') {
+    if (!ix.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+      await confirm(ix, '❌ Apenas admins (Manage Server) podem programar.', { ephemeral: true });
       return;
     }
-    if (name === 'weekly_ranking') {
-      if (!PLAYERS.length) return void interaction.reply('Configure `PLAYERS` no .env.');
-      const { start, end } = lastWeekRange(nowTz());
-      await interaction.reply('Gerando ranking semanal…');
-      const r = await buildRanking(PLAYERS, start, end);
-      await interaction.editReply({ embeds: [rankingToEmbed('Rank Semanal (semana anterior)', r)] });
+    const channel = ix.options.getChannel('canal', true);
+    const horario = ix.options.getString('horario', true);
+    const parsed = parseHHmm(horario);
+    if (!parsed) {
+      await confirm(ix, '⚠️ Use **HH:mm** (24h), ex.: `23:55`.', { ephemeral: true });
       return;
     }
-    if (name === 'monthly_ranking') {
-      if (!PLAYERS.length) return void interaction.reply('Configure `PLAYERS` no .env.');
-      const { start, end } = lastMonthRange(nowTz());
-      await interaction.reply('Gerando ranking mensal…');
-      const r = await buildRanking(PLAYERS, start, end);
-      await interaction.editReply({ embeds: [rankingToEmbed('Rank Mensal (mês anterior)', r)] });
+    await confirm(ix, `🗓️ Agendando **${horario} ${TZ}** em ${channel}…`, { ephemeral: true });
+    qUpsertSchedule.run(guildId, channel.id, horario);
+    await installCronsForGuild(client, guildId);
+    await confirm(ix, `✅ Programado!\n• Canal: ${channel}\n• Horário base: **${horario} ${TZ}**\n• Envia: diário (relatório), **segunda** (ranking semanal da semana anterior) e **1º dia** (ranking mensal do mês anterior).`, { ephemeral: true });
+    return;
+  }
+
+  // /cancelar_programacao (admin)
+  if (name === 'cancelar_programacao') {
+    if (!ix.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+      await confirm(ix, '❌ Apenas admins (Manage Server) podem cancelar programação.', { ephemeral: true });
       return;
     }
-    if (name === 'daily_report' || name === 'weekly_report' || name === 'monthly_report') {
-      const nick = interaction.options.getString('nick', true);
-      let start, end, title;
-      if (name === 'daily_report') {
-        ({ start, end } = todayRange());
-        title = 'Report diário';
-      } else if (name === 'weekly_report') {
-        ({ start, end } = lastWeekRange(nowTz()));
-        title = 'Report semanal (semana anterior)';
-      } else {
-        ({ start, end } = lastMonthRange(nowTz()));
-        title = 'Report mensal (mês anterior)';
+    stopCronsForGuild(guildId);
+    qDelSchedule.run(guildId);
+    await confirm(ix, '🛑 Programações **canceladas** para esta guild.', { ephemeral: true });
+    return;
+  }
+
+  // Map de intervalos
+  const rangeMap = {
+    daily_report:   'day',
+    weekly_report:  'week',
+    monthly_report: 'month',
+    daily_ranking:   'day',
+    weekly_ranking:  'week',
+    monthly_ranking: 'month',
+  };
+
+  if (name in rangeMap) {
+    const range = rangeMap[name];
+    await ix.deferReply(); // público
+
+    const label = range === 'day' ? 'de hoje' :
+                  range === 'week' ? 'dos últimos 7 dias' :
+                  'dos últimos 30 dias';
+
+    const isReport = name.endsWith('report');
+
+    // single (opcional) nos reports
+    const nickOpt = isReport ? ix.options.getString('nick') : null;
+    if (isReport && nickOpt) {
+      const nick = nickOpt.trim();
+      await confirm(ix, `🔎 Recebi **/${name}** — gerando relatório ${label} de **${nick}**…`);
+      try {
+        const r = await collectForUser(nick, range);
+        const title = range === 'day' ? 'Hoje' : range === 'week' ? 'Últimos 7 dias' : 'Últimos 30 dias';
+        await confirm(ix, { embeds: [embedReport(title, r.username, r.url, r.agg)] }, { edit: true });
+        await confirm(ix, `✅ Relatório ${label} de **${nick}** concluído.`);
+      } catch (e) {
+        console.error(e);
+        await confirm(ix, `❌ Falha ao gerar para **${nick}** — ${e?.message || 'erro'}`, { edit: true });
       }
-      await interaction.reply(`Gerando ${title} de **${nick}**…`);
-      const r = await collectPlayerPeriod(nick, start, end);
-      await interaction.editReply({ embeds: [formatPlayerReportEmbed(nick, start, end, r)] });
       return;
     }
-  } catch (err) {
-    console.error('Erro no slash:', err);
-    if (!interaction.replied) {
-      await interaction.reply({ content: `Erro: ${String(err)}`, ephemeral: true });
-    } else {
-      await interaction.editReply({ content: `Erro: ${String(err)}` });
+
+    // Todos os cadastrados
+    await confirm(ix, `🔎 Recebi **/${name}** — gerando ${isReport ? 'relatório' : 'ranking'} ${label}…`);
+    try {
+      const results = await collectForGuild(guildId, range);
+      if (!results.length) {
+        await confirm(ix, '⚠️ Nenhum jogador cadastrado. Use `/cadastrar nick` primeiro.', { edit: true });
+        return;
+      }
+      const total = results.length;
+      const ok = results.filter(r => !r.error).length;
+      const fail = total - ok;
+
+      if (isReport) {
+        const title = range === 'day' ? 'Hoje' : range === 'week' ? 'Últimos 7 dias' : 'Últimos 30 dias';
+        for (const r of results) {
+          if (r.error) await confirm(ix, `❌ Falha em **${r.username}** — ${r.err || 'erro'}`);
+          else await confirm(ix, { embeds: [embedReport(title, r.username, r.url, r.agg)] });
+        }
+        await confirm(ix, `✅ Relatório ${label} concluído. **${ok}/${total}** (erros: ${fail}).`, { edit: true });
+      } else {
+        const rk = buildRankings(results);
+        const title = range === 'day' ? '— Hoje' : range === 'week' ? '— Últimos 7 dias' : '— Últimos 30 dias';
+        await confirm(ix, { embeds: [embedRanking(title, rk)] }, { edit: true });
+        await confirm(ix, `✅ Ranking ${label} gerado. Considerados: **${ok}/${total}** (erros: ${fail}).`);
+      }
+    } catch (e) {
+      console.error(e);
+      await confirm(ix, '❌ Não consegui gerar agora. Tente novamente.', { edit: true });
     }
+    return;
   }
 });
 
-// -----------------------------------------------------------------------------
-// 11) Boot
-client.once('clientReady', async (c) => {
-  console.log(`✅ Logado como ${c.user.tag}`);
-  loadSchedulesAndSetup();
-  await registerSlashCommands();
+// -------------------------------
+// Handler: PREFIXO (inclui !cadastrar)
+// -------------------------------
+client.on('messageCreate', async (msg) => {
+  if (!msg.guild || msg.author.bot) return;
+  const content = msg.content?.trim();
+  if (!content || !content.startsWith(PREFIX)) return;
+
+  const args = content.slice(PREFIX.length).trim().split(/\s+/);
+  const cmd  = (args.shift() || '').toLowerCase();
+
+  const isAdmin = msg.member?.permissions?.has(PermissionFlagsBits.ManageGuild);
+  const send = (m) => msg.channel.send(m);
+
+  // Admin: cadastrar
+  if (cmd === 'cadastrar') {
+    if (!isAdmin) return send('❌ Apenas admins (Manage Server) podem usar `!cadastrar`.');
+    const nick = args.join(' ').trim();
+    if (!nick) return send('Uso: `!cadastrar <nick-ubisoft>`');
+    qInsertPlayer.run(msg.guild.id, nick);
+    const total = qListPlayers.all(msg.guild.id).length;
+    return send(`✅ **${nick}** cadastrado. Jogadores agora: **${total}**.`);
+  }
+
+  // Admin: remover jogador (opcional)
+  if (cmd === 'remover') {
+    if (!isAdmin) return send('❌ Apenas admins (Manage Server) podem usar `!remover`.');
+    const nick = args.join(' ').trim();
+    if (!nick) return send('Uso: `!remover <nick-ubisoft>`');
+    const info = qDeletePlayer.run(msg.guild.id, nick);
+    if (info.changes) return send(`🗑️ **${nick}** removido.`);
+    return send(`⚠️ **${nick}** não estava cadastrado.`);
+  }
+
+  // Admin: programar (#canal HH:mm) — instala 3 crons
+  if (cmd === 'programar') {
+    if (!isAdmin) return send('❌ Apenas admins (Manage Server) podem usar `!programar`.');
+    if (args.length < 2) return send('Uso: `!programar #canal HH:mm`');
+
+    // canal: menção, id ou nome
+    const chMention = msg.mentions.channels.first();
+    let target = chMention;
+    if (!target) {
+      const first = args[0];
+      const byId = msg.guild.channels.cache.get(first);
+      if (byId?.isTextBased()) target = byId;
+      if (!target) {
+        target = msg.guild.channels.cache.find(
+          c => c.isTextBased() && c.name.toLowerCase() === first.replace(/^#/, '').toLowerCase()
+        );
+      }
+    }
+    const horario = args[1];
+    const parsed = parseHHmm(horario || '');
+    if (!target?.isTextBased() || !parsed) {
+      return send('Uso: `!programar #canal HH:mm` (ex.: `!programar #r6-status 23:55`)');
+    }
+
+    await send(`🗓️ Agendando envios base **${horario} ${TZ}** em ${target}…`);
+    qUpsertSchedule.run(msg.guild.id, target.id, horario);
+    await installCronsForGuild(client, msg.guild.id);
+    return send(`✅ Programado!\n• Canal: ${target}\n• Horário base: **${horario} ${TZ}**\n• Envia: diário (relatório), **segunda** (ranking semanal da semana anterior) e **1º dia** (ranking mensal do mês anterior).`);
+  }
+
+  // Admin: cancelar-programação
+  if (cmd === 'cancelar-programação' || cmd === 'cancelar_programacao' || cmd === 'cancelarprogramacao') {
+    if (!isAdmin) return send('❌ Apenas admins (Manage Server) podem usar `!cancelar-programação`.');
+    stopCronsForGuild(msg.guild.id);
+    qDelSchedule.run(msg.guild.id);
+    return send('🛑 Programações **canceladas** para este servidor.');
+  }
+
+  // Map de intervalos
+  const rangeMap = {
+    'daily_report':   'day',
+    'weekly_report':  'week',
+    'monthly_report': 'month',
+    'daily_ranking':   'day',
+    'weekly_ranking':  'week',
+    'monthly_ranking': 'month',
+  };
+
+  if (cmd in rangeMap) {
+    const range = rangeMap[cmd];
+    const isReport = cmd.endsWith('report');
+    const label = range === 'day' ? 'de hoje'
+               : range === 'week' ? 'dos últimos 7 dias'
+               : 'dos últimos 30 dias';
+
+    // single (opcional) nos reports: !daily_report <nick>
+    const singleNick = isReport && args.length ? args.join(' ').trim() : null;
+
+    if (singleNick) {
+      await send(`🔎 Recebi **${PREFIX}${cmd} ${singleNick}** — gerando relatório ${label} de **${singleNick}**…`);
+      try {
+        const r = await collectForUser(singleNick, range);
+        const title = range === 'day' ? 'Hoje' : range === 'week' ? 'Últimos 7 dias' : 'Últimos 30 dias';
+        await send({ embeds: [embedReport(title, r.username, r.url, r.agg)] });
+        await send(`✅ Relatório ${label} de **${singleNick}** concluído.`);
+      } catch (e) {
+        console.error(e);
+        await send(`❌ Falha ao gerar para **${singleNick}** — ${e?.message || 'erro'}`);
+      }
+      return;
+    }
+
+    // todos os cadastrados
+    await send(`🔎 Recebi **${PREFIX}${cmd}** — gerando ${isReport ? 'relatório' : 'ranking'} ${label}…`);
+    try {
+      const results = await collectForGuild(msg.guild.id, range);
+      if (!results.length) return send('⚠️ Nenhum jogador cadastrado. Use `/cadastrar nick` ou `!cadastrar <nick>`.');
+
+      const total = results.length;
+      const ok = results.filter(r => !r.error).length;
+      const fail = total - ok;
+
+      if (isReport) {
+        const title = range === 'day' ? 'Hoje' : range === 'week' ? 'Últimos 7 dias' : 'Últimos 30 dias';
+        for (const r of results) {
+          if (r.error) await send(`❌ Falha em **${r.username}** — ${r.err || 'erro'}`);
+          else await send({ embeds: [embedReport(title, r.username, r.url, r.agg)] });
+        }
+        await send(`✅ Relatório ${label} concluído. **${ok}/${total}** (erros: ${fail}).`);
+      } else {
+        const rk = buildRankings(results);
+        const title = range === 'day' ? '— Hoje' : range === 'week' ? '— Últimos 7 dias' : '— Últimos 30 dias';
+        await send({ embeds: [embedRanking(title, rk)] });
+        await send(`✅ Ranking ${label} gerado. Considerados: **${ok}/${total}** (erros: ${fail}).`);
+      }
+    } catch (e) {
+      console.error(e);
+      await send('❌ Não consegui gerar agora. Tente novamente em alguns minutos.');
+    }
+    return;
+  }
+
+  // Ajuda detalhada (prefixo)
+  if (cmd === 'help' || cmd === 'ajuda') {
+    const eb = new EmbedBuilder()
+      .setTitle('R6 — Ajuda (comandos por prefixo)')
+      .setDescription([
+        `Prefixo atual: **${PREFIX}**`,
+        `Comandos abaixo têm equivalentes em slash (ex.: \`/daily_report\`).`,
+        `Alguns exigem permissão de **Manage Server** (admins).`,
+      ].join('\n'))
+      .addFields(
+        {
+          name: `1) Cadastrar jogador (ADMIN)`,
+          value: [
+            `**Uso:** \`${PREFIX}cadastrar <nick-ubisoft>\``,
+            `O **nick** é o que aparece na URL do TRN.`,
+            `→ \`${PREFIX}cadastrar gabrielgadelham\``,
+          ].join('\n'),
+          inline: false
+        },
+        {
+          name: `2) Programar envios (ADMIN)`,
+          value: [
+            `**Uso:** \`${PREFIX}programar #canal HH:mm\``,
+            `Cria 3 rotinas no mesmo horário:`,
+            `• **Diário:** relatório do dia, todos os dias;`,
+            `• **Semanal:** toda **segunda**, ranking da **semana anterior** (seg-dom);`,
+            `• **Mensal:** todo **dia 1**, ranking do **mês anterior**.`,
+            `Ex.: \`${PREFIX}programar #r6-status 23:55\``,
+          ].join('\n'),
+          inline: false
+        },
+        {
+          name: `3) Cancelar programação (ADMIN)`,
+          value: `**Uso:** \`${PREFIX}cancelar-programação\` (ou \`${PREFIX}cancelar_programacao\`) — interrompe todos os envios agendados.`,
+          inline: false
+        },
+        {
+          name: `4) Relatórios (TODOS)`,
+          value: [
+            `**Hoje:** \`${PREFIX}daily_report [nick]\``,
+            `**Semana (7d):** \`${PREFIX}weekly_report [nick]\``,
+            `**Mês (30d):** \`${PREFIX}monthly_report [nick]\``,
+            `Com \`[nick]\` → relatório só daquele jogador; sem \`[nick]\` → todos os cadastrados.`,
+          ].join('\n'),
+          inline: false
+        },
+        {
+          name: `5) Rankings (TODOS)`,
+          value: [
+            `**Hoje:** \`${PREFIX}daily_ranking\``,
+            `**Semana (7d):** \`${PREFIX}weekly_ranking\``,
+            `**Mês (30d):** \`${PREFIX}monthly_ranking\``,
+            `Categorias: Quem mais matou • Quem mais morreu • Melhor K/D • Melhor HS% • Quem mais venceu`,
+          ].join('\n'),
+          inline: false
+        },
+        {
+          name: 'Dicas',
+          value: [
+            `• O site pode demorar 10–15s para renderizar (o bot já espera).`,
+            `• KD = **K_total/D_total**; HS% ponderado por **kills**.`,
+            `• Para muitas pessoas, o bot manda vários embeds em sequência.`,
+          ].join('\n'),
+          inline: false
+        }
+      )
+      .setTimestamp(new Date());
+    return send({ embeds: [eb] });
+  }
 });
 
-client.login(TOKEN);
+// -------------------------------
+client.login(DISCORD_TOKEN);
