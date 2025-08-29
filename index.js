@@ -1,14 +1,9 @@
-// index.js — ESM
-// -----------------------------------------------------------------------------
-// 1) Imports (ESM) + carregamento do .env
-import 'dotenv/config';
+// topo do index.js (ESM)
+import dotenv from 'dotenv';
+dotenv.config({ quiet: true }); // silencia os logs “injecting env”
+
 import {
-  Client,
-  GatewayIntentBits,
-  Partials,
-  REST,
-  Routes,
-  EmbedBuilder,
+  Client, GatewayIntentBits, Partials, REST, Routes, EmbedBuilder,
 } from 'discord.js';
 import cron from 'node-cron';
 import fs from 'node:fs';
@@ -32,6 +27,10 @@ const PLAYERS =
 const DATA_DIR = path.resolve('./data');
 const SCHEDULE_FILE = path.join(DATA_DIR, 'schedules.json');
 
+if (!TOKEN) {
+  console.error('❌ DISCORD_TOKEN ausente no .env');
+  process.exit(1);
+}
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(SCHEDULE_FILE)) fs.writeFileSync(SCHEDULE_FILE, JSON.stringify({}), 'utf8');
 
