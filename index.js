@@ -1051,7 +1051,7 @@ client.on('messageCreate', async (msg) => {
   if (cmd === 'remover') {
     if (!isAdmin) return send('❌ Apenas admins (Manage Server) podem usar `!remover`.');
     const nick = args.join(' ').trim();
-    if (!nick) return send('Uso: `!remover <nick-ubisoft>``);
+    if (!nick) return send('Uso: `!remover <nick-ubisoft>`');
     const info = qDeletePlayer.run(msg.guild.id, nick);
     if (info.changes) return send(`🗑️ **${nick}** removido.`);
     return send(`⚠️ **${nick}** não estava cadastrado.`);
